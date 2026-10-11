@@ -11,9 +11,9 @@ title: Home
 ![Kubernetes](https://img.shields.io/badge/kubernetes-%23326ce5.svg?style=for-the-badge&logo=kubernetes&logoColor=white)
 
 [![Apache licensed](https://img.shields.io/badge/license-Apache-blue.svg)](./LICENSE)
-[![ci](https://github.com/sebt3/kuberest/actions/workflows/ci.yml/badge.svg)](https://github.com/sebt3/kuberest/actions/workflows/ci.yml)
-[![docker image](https://img.shields.io/docker/pulls/sebt3/kuberest.svg)](
-https://hub.docker.com/r/sebt3/kuberest/tags/)
+[![ci](https://github.com/vynil-org/kuberest/actions/workflows/ci.yml/badge.svg)](https://github.com/vynil-org/kuberest/actions/workflows/ci.yml)
+[![container image](https://img.shields.io/badge/ghcr.io-vynil--org%2Fkuberest-blue?logo=github)](
+https://github.com/vynil-org/kuberest/pkgs/container/kuberest)
 
 
 This repository contains a custom Kubernetes controller that can create/update/delete REST object on RESTfull api-endpoint.
@@ -27,7 +27,7 @@ The main goal is to not write a post-install Job filled with curl commands ever 
 
 ## Installation
 
-(TL;DR: `kubectl apply -k github.com/sebt3/kuberest//deploy`)
+(TL;DR: `kubectl apply -k github.com/vynil-org/kuberest//deploy`)
 
 Since this is a kubernetes operator, the installations steps are:
 - first the CustomResourceDefinition
@@ -46,7 +46,7 @@ kubectl apply -f deploy/crd/crd.yaml
 #### kustomize
 
 ```sh
-kubectl apply -k github.com/sebt3/kuberest//deploy/crd
+kubectl apply -k github.com/vynil-org/kuberest//deploy/crd
 ```
 
 ### Operator
@@ -61,13 +61,13 @@ kubectl wait --for=condition=available deploy/kuberest --timeout=30s
 #### kustomize
 
 ```sh
-kubectl apply -k github.com/sebt3/kuberest//deploy/operator
+kubectl apply -k github.com/vynil-org/kuberest//deploy/operator
 ```
 
 #### helm
 
 ```sh
-helm repo add kuberest https://sebt3.github.io/kuberest/
+helm repo add kuberest https://vynil-org.github.io/kuberest/
 kubectl create ns kuberest
 helm install kuberest/kuberest kuberest --namespace kuberest
 ```

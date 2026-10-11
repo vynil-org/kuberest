@@ -7,7 +7,7 @@ permalink: /docs/
 
 The following section will document the `spec` of a `RestEndpoint`.
 
-For more completes examples please see the [one in the repo](https://github.com/sebt3/kuberest/tree/main/examples)
+For more completes examples please see the [one in the repo](https://github.com/vynil-org/kuberest/tree/main/examples)
 
 ### Availability of the *values* for both *handlebars* templates and *rhai* scripts
 

@@ -4,7 +4,7 @@ title: Installation
 permalink: /install/
 ---
 
-(TL;DR: `kubectl apply -k github.com/sebt3/kuberest//deploy`)
+(TL;DR: `kubectl apply -k github.com/vynil-org/kuberest//deploy`)
 
 Since this is a kubernetes operator, the installations steps are:
 - first the CustomResourceDefinition
@@ -23,7 +23,7 @@ kubectl apply -f deploy/crd/crd.yaml
 #### kustomize
 
 ```sh
-kubectl apply -k github.com/sebt3/kuberest//deploy/crd
+kubectl apply -k github.com/vynil-org/kuberest//deploy/crd
 ```
 
 ### Operator
@@ -39,14 +39,14 @@ kubectl wait --for=condition=available deploy/kuberest --timeout=30s
 
 ```sh
 kubectl create ns kuberest
-kubectl apply -k github.com/sebt3/kuberest//deploy/operator
+kubectl apply -k github.com/vynil-org/kuberest//deploy/operator
 kubectl wait -n kuberest --for=condition=available deploy/kuberest --timeout=30s
 ```
 
 #### helm
 
 ```sh
-helm repo add kuberest https://sebt3.github.io/kuberest/
+helm repo add kuberest https://vynil-org.github.io/kuberest/
 kubectl create ns kuberest
 helm install kuberest/kuberest kuberest --namespace kuberest
 kubectl wait -n kuberest --for=condition=available deploy/kuberest --timeout=30s

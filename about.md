@@ -9,9 +9,9 @@ permalink: /about/
 ![Kubernetes](https://img.shields.io/badge/kubernetes-%23326ce5.svg?style=for-the-badge&logo=kubernetes&logoColor=white)
 
 [![Apache licensed](https://img.shields.io/badge/license-Apache-blue.svg)](./LICENSE)
-[![ci](https://github.com/sebt3/kuberest/actions/workflows/ci.yml/badge.svg)](https://github.com/sebt3/kuberest/actions/workflows/ci.yml)
-[![docker image](https://img.shields.io/docker/pulls/sebt3/kuberest.svg)](
-https://hub.docker.com/r/sebt3/kuberest/tags/)
+[![ci](https://github.com/vynil-org/kuberest/actions/workflows/ci.yml/badge.svg)](https://github.com/vynil-org/kuberest/actions/workflows/ci.yml)
+[![container image](https://img.shields.io/badge/ghcr.io-vynil--org%2Fkuberest-blue?logo=github)](
+https://github.com/vynil-org/kuberest/pkgs/container/kuberest)
 
 
 This repository contains a custom Kubernetes controller that can create/update/delete REST object on RESTfull api-endpoint.
