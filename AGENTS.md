@@ -15,7 +15,7 @@ Inspirations : le provider Terraform `Mastercard/restapi` et Tekton.
 - **CRD** : `RestEndPoint` — groupe `kuberest.solidite.fr`, pluriel
   `restendpoints`, nom court `rep`.
 - **Licence** : Apache-2.0. **Édition Rust** : 2024.
-- **Doc publiée** : https://sebt3.github.io/kuberest/docs/
+- **Doc publiée** : https://vynil-org.github.io/kuberest/docs/
 
 ## Architecture
 

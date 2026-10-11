@@ -22,7 +22,7 @@ fmt = { cmd=[
     "cargo +nightly fmt"
 ]}
 operator = { cmd=[
-    "podman build . -t docker.io/sebt3/kuberest:$(awk '/^version =/{print $3;exit}' Cargo.toml|sed 's/\"//g') && podman push docker.io/sebt3/kuberest:$(awk '/^version =/{print $3;exit}' Cargo.toml|sed 's/\"//g')",
+    "podman build . -t ghcr.io/vynil-org/kuberest:$(awk '/^version =/{print $3;exit}' Cargo.toml|sed 's/\"//g') && podman push ghcr.io/vynil-org/kuberest:$(awk '/^version =/{print $3;exit}' Cargo.toml|sed 's/\"//g')",
 ]}
 precommit = { cmd=[
     "cargo update",

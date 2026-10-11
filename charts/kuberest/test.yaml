@@ -1,5 +1,5 @@
 image:
-  repository: sebt3/kuberest
+  repository: ghcr.io/vynil-org/kuberest
   pullPolicy: Always
   tag: "latest"
 namespace: default

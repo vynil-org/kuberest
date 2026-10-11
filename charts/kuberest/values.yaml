@@ -4,7 +4,7 @@ namespace: "default"
 version: "" # pin a specific version
 
 image:
-  repository: sebt3/kuberest
+  repository: ghcr.io/vynil-org/kuberest
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

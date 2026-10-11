@@ -142,7 +142,7 @@ spec:
         {}
       containers:
       - name: kuberest
-        image: sebt3/kuberest:1.4.1
+        image: ghcr.io/vynil-org/kuberest:1.4.1
         imagePullPolicy: IfNotPresent
         securityContext:
           {}
