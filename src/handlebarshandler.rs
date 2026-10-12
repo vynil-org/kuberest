@@ -17,3 +17,23 @@ pub fn new_hbs() -> HandleBars<'static> {
         .register_helper("gen_password_alphanum", Box::new(gen_password_alphanum));
     hbs
 }
+
+#[cfg(test)]
+mod tests {
+    use super::new_hbs;
+    use serde_json::json;
+
+    // vynil-core 0.8.0: the helper renders an empty string (after a warn) for 72 bytes or more.
+    #[test]
+    fn bcrypt_hash_helper_refuses_72_bytes() {
+        let mut hbs = new_hbs();
+        let ok = hbs
+            .render("{{ bcrypt_hash pwd }}", &json!({"pwd": "x".repeat(71)}))
+            .unwrap();
+        assert_eq!(ok.len(), 60);
+        let refused = hbs
+            .render("{{ bcrypt_hash pwd }}", &json!({"pwd": "x".repeat(72)}))
+            .unwrap();
+        assert_eq!(refused, "");
+    }
+}

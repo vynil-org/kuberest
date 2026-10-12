@@ -94,6 +94,14 @@ régénéré et commité casse le build. `cargo cmd precommit` enchaîne
 - Brancher avant de committer si on est sur `main`. Committer/pousser
   uniquement sur demande explicite.
 
+## Relecture
+
+Le dépôt est codétenu : le ruleset `main` (réglage GitHub, hors dépôt) exige une PR,
+l'approbation d'un code owner (`.github/CODEOWNERS`) autre que l'auteur de la PR et que
+l'auteur du dernier push, les fils résolus et les checks CI listés ci-dessous au vert,
+sans bypass. Aucun merge sans l'autre développeur. Checks requis : `docker`,
+`otel-docker`, `lint`, `unit`, `integration`.
+
 ## Doute sur l'usage métier ?
 
 L'auteur du projet est disponible : en cas de doute sur le comportement attendu

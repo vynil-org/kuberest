@@ -198,6 +198,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # deploy/operator/deployment.yaml is rendered with this exact helm version: the blank
+      # lines between documents differ from one helm release to another.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.0
+
       # Real CI work starts here
       - name: Build workspace
         run: cargo build
