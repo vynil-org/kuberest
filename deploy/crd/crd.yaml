@@ -60,18 +60,16 @@ spec:
                     nullable: true
                     type: string
                   createMethod:
-                    description: 'Method to use when creating an object (default: Get)'
+                    description: Create verbs accepted by [`RestClient::obj_create`].
                     enum:
                     - Post
                     - Put
-                    - null
                     nullable: true
                     type: string
                   deleteMethod:
-                    description: 'Method to use when deleting an object (default: Delete)'
+                    description: Delete verbs accepted by [`RestClient::obj_delete`].
                     enum:
                     - Delete
-                    - null
                     nullable: true
                     type: string
                   headers:
@@ -85,10 +83,9 @@ spec:
                     nullable: true
                     type: string
                   readMethod:
-                    description: 'Method to use when reading an object (default: Post)'
+                    description: Read verb accepted by [`RestClient::obj_read`].
                     enum:
                     - Get
-                    - null
                     nullable: true
                     type: string
                   serverCa:
@@ -100,13 +97,12 @@ spec:
                     nullable: true
                     type: boolean
                   updateMethod:
-                    description: 'Method to use when updating an object (default: Put)'
+                    description: Update verbs accepted by [`RestClient::obj_update`].
                     enum:
                     - Patch
                     - Put
                     - Post
                     - None
-                    - null
                     nullable: true
                     type: string
                 required:
@@ -294,10 +290,9 @@ spec:
                       description: path appended to the client's baseurl for this group of objects
                       type: string
                     read_method:
-                      description: 'Method to use when reading an object (default: Get)'
+                      description: Read verb accepted by [`RestClient::obj_read`].
                       enum:
                       - Get
-                      - null
                       nullable: true
                       type: string
                   required:
@@ -344,18 +339,16 @@ spec:
                       nullable: true
                       type: boolean
                     createMethod:
-                      description: 'Method to use when creating an object (default: Post)'
+                      description: Create verbs accepted by [`RestClient::obj_create`].
                       enum:
                       - Post
                       - Put
-                      - null
                       nullable: true
                       type: string
                     deleteMethod:
-                      description: 'Method to use when deleting an object (default: Delete)'
+                      description: Delete verbs accepted by [`RestClient::obj_delete`].
                       enum:
                       - Delete
-                      - null
                       nullable: true
                       type: string
                     items:
@@ -401,10 +394,9 @@ spec:
                       description: path appended to the client's baseurl for this group of objects
                       type: string
                     readMethod:
-                      description: 'Method to use when reading an object (default: Get)'
+                      description: Read verb accepted by [`RestClient::obj_read`].
                       enum:
                       - Get
-                      - null
                       nullable: true
                       type: string
                     teardown:
@@ -412,13 +404,12 @@ spec:
                       nullable: true
                       type: boolean
                     updateMethod:
-                      description: 'Method to use when updating an object (default: Patch)'
+                      description: Update verbs accepted by [`RestClient::obj_update`].
                       enum:
                       - Patch
                       - Put
                       - Post
                       - None
-                      - null
                       nullable: true
                       type: string
                     updatePath:

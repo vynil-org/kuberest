@@ -61,3 +61,30 @@ impl Script {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Script;
+
+    // vynil-core 0.8.0: bcrypt_hash refuses inputs of 72 bytes or more instead of truncating them.
+    #[test]
+    fn bcrypt_hash_accepts_71_bytes() {
+        let mut script = Script::new();
+        let out = script
+            .eval(&format!(r#"#{{ hash: bcrypt_hash("{}") }}"#, "x".repeat(71)))
+            .expect("71 bytes must be accepted");
+        assert_eq!(out["hash"].as_str().map(str::len), Some(60));
+    }
+
+    #[test]
+    fn bcrypt_hash_refuses_72_bytes() {
+        let mut script = Script::new();
+        let err = script
+            .eval(&format!(r#"#{{ hash: bcrypt_hash("{}") }}"#, "x".repeat(72)))
+            .expect_err("72 bytes must be refused");
+        assert!(
+            err.to_string().contains("Expected 72 bytes or fewer"),
+            "unexpected error: {err}"
+        );
+    }
+}

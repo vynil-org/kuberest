@@ -58,7 +58,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ghcr.io/${{ github.repository_owner }}/kuberest:e2e
           cache-from: type=gha,scope=base
           outputs: type=docker,dest=/tmp/image.tar
 
@@ -132,17 +132,28 @@ jobs:
         with:
           name: controller-image
           path: /tmp
-      - name: Load docker image from tarball
-        run: docker load --input /tmp/image.tar
+      # The k3d nodes have their own containerd: a plain `docker load` on the
+      # runner is invisible to them, the image has to be imported in the cluster.
+      - name: Import docker image tarball into k3d
+        run: k3d image import /tmp/image.tar -c kube
       - name: helm template | kubctl apply
         run: |
           apiserver="$(kubectl get endpoints kubernetes -ojson | jq '.subsets[0].addresses[0].ip' -r)"
           helm template charts/kuberest \
-            --set version=latest \
+            --set version=e2e \
             --set networkPolicy.enabled=true \
             --set networkPolicy.apiserver.0=${apiserver}/32 \
             | kubectl apply -f -
-      - run: kubectl wait --for=condition=available deploy/kuberest --timeout=60s
+      - run: kubectl wait --for=condition=available deploy/kuberest --timeout=120s
+      - name: Dump controller state on failure
+        if: failure()
+        run: |
+          kubectl get pods -o wide
+          kubectl describe deploy/kuberest
+          kubectl describe pods -l app=kuberest
+          kubectl logs deploy/kuberest --all-containers --previous || true
+          kubectl logs deploy/kuberest --all-containers || true
+          kubectl get events --sort-by=.lastTimestamp
       - run: kubectl apply -f examples/abuses/uuidgen.yaml
       - run: kubectl wait --for=condition=ready rep/uuidgen
       # verify reconcile actions have happened
@@ -197,6 +208,12 @@ jobs:
           fetch-depth: 2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # deploy/operator/deployment.yaml is rendered with this exact helm version: the blank
+      # lines between documents differ from one helm release to another.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.0
 
       # Real CI work starts here
       - name: Build workspace
