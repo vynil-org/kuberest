@@ -132,8 +132,10 @@ jobs:
         with:
           name: controller-image
           path: /tmp
-      - name: Load docker image from tarball
-        run: docker load --input /tmp/image.tar
+      # The k3d nodes have their own containerd: a plain `docker load` on the
+      # runner is invisible to them, the image has to be imported in the cluster.
+      - name: Import docker image tarball into k3d
+        run: k3d image import /tmp/image.tar -c kube
       - name: helm template | kubctl apply
         run: |
           apiserver="$(kubectl get endpoints kubernetes -ojson | jq '.subsets[0].addresses[0].ip' -r)"
