@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::restendpoint::{Metadata, RESTPATH_FINALIZER, RestEndPoint};
 use anyhow::{Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use k8s_openapi::ByteString;
 use kube::{
     Client,
     api::{Api, DeleteParams, ListParams, ObjectList, Patch, PatchParams, PostParams},
@@ -10,6 +11,24 @@ use kube::{
 use tracing::warn;
 
 pub use k8s_openapi::api::core::v1::Secret;
+
+/// Whether the existing Secret `data` holds `decoded` under `key`.
+/// A key that is missing from the existing Secret counts as unmatched, so the
+/// caller updates the Secret instead of panicking on the lookup.
+fn secret_value_matches(data: &BTreeMap<String, ByteString>, key: &str, decoded: &str) -> bool {
+    match data.get(key) {
+        Some(value) => {
+            serde_json::to_string(value).unwrap() == serde_json::to_string(&STANDARD.encode(decoded)).unwrap()
+        }
+        None => false,
+    }
+}
+
+/// Whether the existing ConfigMap `data` holds `val` under `key`; a missing key counts as unmatched.
+fn configmap_value_matches(data: &BTreeMap<String, String>, key: &str, val: &str) -> bool {
+    data.get(key).is_some_and(|v| v == val)
+}
+
 pub struct SecretHandler {
     api: Api<Secret>,
     namespace: String,
@@ -63,9 +82,7 @@ impl SecretHandler {
         if let Some(secret) = s {
             if let Some(data) = secret.data {
                 for (k, decoded) in strings {
-                    if serde_json::to_string(&data[k]).unwrap()
-                        != serde_json::to_string(&STANDARD.encode(decoded)).unwrap()
-                    {
+                    if !secret_value_matches(&data, k, decoded) {
                         tracing::debug!("Unmatched data for {k}");
                         matched = false;
                         break;
@@ -246,7 +263,7 @@ impl ConfigMapHandler {
         if let Some(cm) = c {
             if let Some(data) = cm.data {
                 for (k, val) in datas {
-                    if data[k] != *val {
+                    if !configmap_value_matches(&data, k, val) {
                         tracing::debug!("Unmatched data for {k}");
                         matched = false;
                         break;
@@ -334,5 +351,36 @@ impl ConfigMapHandler {
             .await
             .or_else(|e| bail!("{e:?}"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_value_matches_compares_existing_key() {
+        let data = BTreeMap::from([("a".to_string(), ByteString(b"1".to_vec()))]);
+        assert!(secret_value_matches(&data, "a", "1"));
+        assert!(!secret_value_matches(&data, "a", "2"));
+    }
+
+    #[test]
+    fn secret_value_matches_missing_key_is_unmatched() {
+        let data = BTreeMap::from([("a".to_string(), ByteString(b"1".to_vec()))]);
+        assert!(!secret_value_matches(&data, "b", "2"));
+    }
+
+    #[test]
+    fn configmap_value_matches_compares_existing_key() {
+        let data = BTreeMap::from([("a".to_string(), "1".to_string())]);
+        assert!(configmap_value_matches(&data, "a", "1"));
+        assert!(!configmap_value_matches(&data, "a", "2"));
+    }
+
+    #[test]
+    fn configmap_value_matches_missing_key_is_unmatched() {
+        let data = BTreeMap::from([("a".to_string(), "1".to_string())]);
+        assert!(!configmap_value_matches(&data, "b", "2"));
     }
 }
