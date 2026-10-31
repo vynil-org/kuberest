@@ -1,0 +1,21 @@
+apiVersion: kuberest.solidite.fr/v1
+kind: RestEndPoint
+metadata:
+  name: output-new-key
+spec:
+  checkFrequency: 0
+  client:
+    baseurl: "http://localhost:8080"
+  outputs:
+  - kind: Secret
+    metadata:
+      name: output-new-key
+    data:
+      a: "1"
+      b: "2"
+  - kind: ConfigMap
+    metadata:
+      name: output-new-key
+    data:
+      a: "1"
+      b: "2"

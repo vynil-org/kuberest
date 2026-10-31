@@ -166,6 +166,12 @@ jobs:
       - run: kubectl apply -f examples/abuses/self-health.yaml
       - run: kubectl wait --for=condition=ready rep/self-health --timeout=60s
       - run: kubectl get cm self-health -ojsonpath='{.data.health}' | grep healthy
+      # Regression for issue #15: adding a new key to outputs[].data must not panic
+      - run: kubectl apply -f examples/abuses/output-new-key.yaml
+      - run: kubectl wait --for=condition=ready rep/output-new-key --timeout=60s
+      - run: kubectl apply -f examples/abuses/output-new-key-updated.yaml
+      - run: kubectl wait --for=jsonpath='{.data.b}'=Mg== secret/output-new-key --timeout=60s
+      - run: kubectl wait --for=jsonpath='{.data.b}'=2 cm/output-new-key --timeout=60s
       # the controller must still be alive (no CrashLoopBackOff)
       - name: Controller did not restart
         run: |
