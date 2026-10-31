@@ -161,6 +161,18 @@ jobs:
       - run: kubectl get event --field-selector "involvedObject.kind=RestEndPoint,involvedObject.name=uuidgen" | grep "IgnoredInput"
       - run: kubectl get secrets output
       - run: kubectl get rep -oyaml | grep -A1 finalizers | grep restendpoints.kuberest.solidite.fr
+      # Exercise the RestClient path (HTTP call to the controller's own /health):
+      # it panics at the first request if vynil_core::set_client_name was not called.
+      - run: kubectl apply -f examples/abuses/self-health.yaml
+      - run: kubectl wait --for=condition=ready rep/self-health --timeout=60s
+      - run: kubectl get cm self-health -ojsonpath='{.data.health}' | grep healthy
+      # the controller must still be alive (no CrashLoopBackOff)
+      - name: Controller did not restart
+        run: |
+          sleep 20
+          restarts="$(kubectl get pods -l app=kuberest -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}')"
+          echo "restarts: ${restarts}"
+          for r in ${restarts}; do test "$r" = "0"; done
       # TODO: add more e2e tests
 
   lint:

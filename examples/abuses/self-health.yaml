@@ -1,0 +1,18 @@
+apiVersion: kuberest.solidite.fr/v1
+kind: RestEndPoint
+metadata:
+  name: self-health
+spec:
+  checkFrequency: 10
+  client:
+    baseurl: "http://localhost:8080"
+  reads:
+  - name: self
+    path: health
+    items: [{"name": "health", "key": ""}]
+  outputs:
+  - kind: ConfigMap
+    metadata:
+      name: self-health
+    data:
+      health: "{{ read.self.health }}"

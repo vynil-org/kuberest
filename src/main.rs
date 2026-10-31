@@ -27,6 +27,8 @@ async fn index(c: Data<State>, _req: HttpRequest) -> impl Responder {
 static PORT_VAR_NAME: &str = "PORT";
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // vynil-core has no default identity: it must be set before any RestClient or k8s call
+    vynil_core::set_client_name(controller::restendpoint::get_client_name);
     telemetry::init().await;
     let port = if env::var(PORT_VAR_NAME).is_ok() {
         env::var(PORT_VAR_NAME).unwrap()
