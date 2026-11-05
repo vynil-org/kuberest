@@ -179,6 +179,54 @@ jobs:
           restarts="$(kubectl get pods -l app=kuberest -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}')"
           echo "restarts: ${restarts}"
           for r in ${restarts}; do test "$r" = "0"; done
+      # Vault (examples/vault): a real Vault in dev mode, token authentication
+      - run: kubectl apply -f examples/vault/dev-vault.yaml
+      - run: kubectl wait --for=condition=available deploy/vault --timeout=120s
+      - name: Vault, Kubernetes -> Vault (static key, diff before update)
+        env:
+          VAULT: kubectl exec deploy/vault -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault
+        run: |
+          set -eu
+          kubectl create secret generic app-secret --from-literal=password=v1 --from-literal=user=alice
+          kubectl apply -f examples/vault/write-kv.yaml
+          kubectl wait --for=condition=ready rep/vault-write-kv --timeout=60s
+          test "$($VAULT kv get -field=password secret/app)" = "v1"
+          test "$($VAULT kv metadata get -format=json secret/app | jq .data.current_version)" = "1"
+          # reconcile again without any change (a new generation forces it): no new KV version
+          for n in 61 62 63; do
+            kubectl patch rep vault-write-kv --type=merge -p "{\"spec\":{\"checkFrequency\":$n}}"
+            sleep 8
+          done
+          test "$($VAULT kv metadata get -format=json secret/app | jq .data.current_version)" = "1"
+          # a changed Secret is written: version 2
+          kubectl create secret generic app-secret --from-literal=password=v2 --from-literal=user=alice --dry-run=client -o yaml | kubectl apply -f -
+          kubectl patch rep vault-write-kv --type=merge -p '{"spec":{"checkFrequency":64}}'
+          for i in $(seq 1 30); do
+            [ "$($VAULT kv get -field=password secret/app)" = "v2" ] && break
+            sleep 2
+          done
+          test "$($VAULT kv get -field=password secret/app)" = "v2"
+          test "$($VAULT kv metadata get -format=json secret/app | jq .data.current_version)" = "2"
+          # a manual drift is corrected: the Secret's value is written back
+          $VAULT kv put secret/app password=HACKED user=alice
+          kubectl patch rep vault-write-kv --type=merge -p '{"spec":{"checkFrequency":65}}'
+          for i in $(seq 1 30); do
+            [ "$($VAULT kv get -field=password secret/app)" = "v2" ] && break
+            sleep 2
+          done
+          test "$($VAULT kv get -field=password secret/app)" = "v2"
+      - name: Vault, Vault -> Kubernetes (read) and teardown
+        env:
+          VAULT: kubectl exec deploy/vault -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault
+        run: |
+          set -eu
+          $VAULT kv put secret/from-vault password=s3cr3t
+          kubectl apply -f examples/vault/read-kv.yaml
+          kubectl wait --for=condition=ready rep/vault-read-kv --timeout=60s
+          test "$(kubectl get secret from-vault -ojsonpath='{.data.password}' | base64 -d)" = "s3cr3t"
+          # teardown deletes what the RestEndPoint wrote
+          kubectl delete rep vault-write-kv --timeout=60s
+          if $VAULT kv get -field=password secret/app; then echo "secret/app still readable"; exit 1; fi
       # TODO: add more e2e tests
 
   lint:

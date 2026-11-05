@@ -1,0 +1,43 @@
+# Copy a Secret into a Vault KV v2 secret (Kubernetes -> Vault).
+#
+# - `key` makes the object live at `secret/data/app` (a PUT on a known name, no key to read back,
+#   an empty 204 answer is fine) and is what gets deleted on teardown.
+# - Every write to KV v2 creates a new version, even with identical data. `diff: Subset` reads the
+#   secret first and only writes when it differs, so checkFrequency can stay short and a manual
+#   change in Vault is corrected at the next reconcile.
+# - The desired values are shaped like the write payload (`{data: {...}}`) and the answer of a
+#   read is shaped differently (`{data: {data: {...}, metadata: {...}}}`): both are narrowed to the
+#   data with `valuesQuery` / `readValuesQuery` before they are compared.
+apiVersion: kuberest.solidite.fr/v1
+kind: RestEndPoint
+metadata:
+  name: vault-write-kv
+spec:
+  checkFrequency: 60
+  inputs:
+  - name: token
+    secretRef:
+      name: vault-token
+  - name: src
+    secretRef:
+      name: app-secret
+  client:
+    baseurl: http://vault:8200/v1
+    headers:
+      X-Vault-Token: '{{ base64_decode input.token.data.token }}'
+  writes:
+  - name: kv
+    path: secret/data
+    createMethod: Put
+    updateMethod: Put
+    diff: Subset
+    items:
+    - name: app
+      key: app
+      valuesQuery: "$.data"
+      readValuesQuery: "$.data.data"
+      values: |
+        data:
+        {{#each input.src.data}}
+          {{@key}}: {{{ json_to_str (base64_decode this) }}}
+        {{/each}}
