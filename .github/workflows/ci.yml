@@ -234,9 +234,6 @@ jobs:
           kubectl logs deploy/kuberest --all-containers --tail=80 || true
           kubectl get events --sort-by=.lastTimestamp | tail -30
           kubectl get networkpolicy -o yaml
-          # Same labels as the operator: is the Vault service name resolvable and reachable under the NetworkPolicies?
-          kubectl run netprobe --labels app=kuberest --image=busybox:1.36 --restart=Never --rm -i --pod-running-timeout=60s -- \
-            sh -c 'nslookup vault; wget -qO- -T5 http://vault:8200/v1/sys/health' || true
       # TODO: add more e2e tests
 
   lint:

@@ -39,14 +39,19 @@ spec:
       protocol: TCP
 
   {{- if .Values.networkPolicy.dns }}
-  # DNS egress
+  # DNS egress (the DNS pods live in their own namespace: a podSelector alone only matches this one)
   - to:
-    - podSelector:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .Values.networkPolicy.dnsNamespace | default "kube-system" }}
+      podSelector:
         matchLabels:
           k8s-app: kube-dns
     ports:
     - port: 53
       protocol: UDP
+    - port: 53
+      protocol: TCP
   {{- end }}
 
   ingress:
