@@ -1379,10 +1379,16 @@ impl RestEndPoint {
                                 .clone()
                                 .unwrap_or(CreateMethod::Post),
                         ),
-                        read_method: group
+                        // the existence check of a write must be a side-effect free read:
+                        // `Post` is only meant for `reads` groups
+                        read_method: match group
                             .read_method
                             .clone()
-                            .unwrap_or(self.spec.client.read_method.clone().unwrap_or(ReadMethod::Get)),
+                            .unwrap_or(self.spec.client.read_method.clone().unwrap_or(ReadMethod::Get))
+                        {
+                            ReadMethod::Post => ReadMethod::Get,
+                            m => m,
+                        },
                         update_method: group.update_method.clone().unwrap_or(
                             self.spec
                                 .client
