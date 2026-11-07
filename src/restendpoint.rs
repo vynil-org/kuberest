@@ -189,11 +189,12 @@ pub struct WriteGroupItem {
     pub read_json_query: Option<String>,
     /// Static key (handlebars): the object lives at `<path>/<key>`; create, update and delete use that url and no key is read from the answers
     pub key: Option<String>,
-    /// Adopt a pre-existing object (found through readPath, or at `<path>/<key>`) instead of creating it (default: group value or false)
+    /// Adopt a pre-existing object (found through readPath, or at `<path>/<key>`) instead of creating it. An existing object answering with an empty body is seen as absent and created (default: group value or false)
     pub adopt: Option<bool>,
     /// Compare the observed object with the values before updating it (default: group value or None)
     pub diff: Option<DiffMode>,
-    /// JSON path applied on the rendered values before the comparison (diff)
+    /// JSON path applied on the rendered values before the comparison (diff). An invalid path is an error;
+    /// a path matching nothing (or several values) compares the whole value, i.e. the object is updated
     pub values_query: Option<String>,
     /// JSON path applied on the observed answer before the comparison (diff). Default: the readJsonQuery result
     pub read_values_query: Option<String>,
@@ -232,7 +233,8 @@ pub struct WriteGroup {
     pub adopt: Option<bool>,
     /// Default for the items: compare the observed object with the values before updating it (default: None)
     pub diff: Option<DiffMode>,
-    /// The API answers writes with a task to follow before the object is settled
+    /// The API answers writes with a task to follow before the object is settled.
+    /// Only creates and updates are followed: a DELETE answering with a task is considered done.
     #[serde(rename = "async")]
     pub async_write: Option<AsyncWrite>,
 }
@@ -484,6 +486,8 @@ pub struct OwnedRestPoint {
     pub key_is_path: Option<bool>,
     /// Reference of the asynchronous task still running for this object
     pub pending_task: Option<String>,
+    /// When that task has been started (seconds since the epoch)
+    pub pending_since: Option<u64>,
 }
 impl OwnedRestPoint {
     #[must_use]
@@ -506,6 +510,7 @@ impl OwnedRestPoint {
             key_name: Some(key_name.to_string()),
             key_is_path: None,
             pending_task: None,
+            pending_since: None,
         }
     }
 
@@ -518,6 +523,12 @@ impl OwnedRestPoint {
     #[must_use]
     pub fn with_pending_task(mut self, task: Option<String>) -> OwnedRestPoint {
         self.pending_task = task;
+        self
+    }
+
+    #[must_use]
+    pub fn with_pending_since(mut self, since: Option<u64>) -> OwnedRestPoint {
+        self.pending_since = since;
         self
     }
 
@@ -1381,6 +1392,7 @@ impl RestEndPoint {
                         ),
                         async_write: group.async_write.clone(),
                         base_path: base_path.clone(),
+                        now: chrono::Utc::now().timestamp().unsigned_abs(),
                     };
                     let mut api = rest.clone();
                     let res = writes::process_item(&mut api, &cx, old.as_ref(), &vals);
@@ -1412,7 +1424,8 @@ impl RestEndPoint {
                                 key_name.as_str(),
                             )
                             .with_key_is_path(key_is_path)
-                            .with_pending_task(res.pending_task),
+                            .with_pending_task(res.pending_task)
+                            .with_pending_since(res.pending_since),
                         );
                     }
                 }

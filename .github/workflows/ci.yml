@@ -187,6 +187,15 @@ jobs:
           VAULT: kubectl exec deploy/vault -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault
         run: |
           set -eu
+          # wait until the controller has reconciled the current generation of the rep
+          reconciled() {
+            for i in $(seq 1 60); do
+              g=$(kubectl get rep vault-write-kv -o jsonpath='{.metadata.generation}')
+              [ "$(kubectl get rep vault-write-kv -o jsonpath='{.status.generation}')" = "$g" ] && return 0
+              sleep 2
+            done
+            echo "vault-write-kv not reconciled"; return 1
+          }
           kubectl create secret generic app-secret --from-literal=password=v1 --from-literal=user=alice
           kubectl apply -f examples/vault/write-kv.yaml
           kubectl wait --for=condition=ready rep/vault-write-kv --timeout=60s
@@ -195,7 +204,7 @@ jobs:
           # reconcile again without any change (a new generation forces it): no new KV version
           for n in 61 62 63; do
             kubectl patch rep vault-write-kv --type=merge -p "{\"spec\":{\"checkFrequency\":$n}}"
-            sleep 8
+            reconciled
           done
           test "$($VAULT kv metadata get -format=json secret/app | jq .data.current_version)" = "1"
           # a changed Secret is written: version 2

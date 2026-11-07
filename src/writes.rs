@@ -15,7 +15,11 @@ use vynil_core::{
     http::{CreateMethod, ReadMethod, RestClient, UpdateMethod},
 };
 
-/// How to compare the observed object with the desired values before updating it
+/// How to compare the observed object with the desired values before updating it.
+///
+/// The comparison is deliberately tolerant (provisional, to be aligned with vynil-core later):
+/// a desired `null` matches a missing key and `1` equals `1.0`. An observed object that cannot
+/// be read (404 or an empty answer) is considered absent: with `adopt` it is created.
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug, JsonSchema, Default)]
 pub enum DiffMode {
     /// No comparison: the object is updated at every reconcile (default)
@@ -42,7 +46,12 @@ pub struct AsyncWrite {
     /// JSON path, in a finished task, of the reference of the created object (e.g. `$.created_resources[0]`).
     /// Without it the object is found back through the item's readPath.
     pub result_path: Option<String>,
+    /// Seconds after which a task still running is considered failed (default: 600)
+    pub timeout_seconds: Option<u64>,
 }
+
+/// Default time (seconds) after which a running asynchronous task is given up
+pub const DEFAULT_TASK_TIMEOUT: u64 = 600;
 
 /// The HTTP operations needed to maintain an object
 pub trait ObjApi {
@@ -105,6 +114,8 @@ pub struct ItemCtx {
     pub async_write: Option<AsyncWrite>,
     /// Path part of the client's baseurl (stripped from hrefs when `key_is_path`)
     pub base_path: String,
+    /// Current time (seconds since the epoch), used to time out asynchronous tasks
+    pub now: u64,
 }
 
 /// Outcome of [`process_item`]
@@ -118,6 +129,8 @@ pub struct ItemResult {
     pub pending_task: Option<String>,
     /// The item waits for a task: the following items must not be processed
     pub pending: bool,
+    /// When the pending task has been started (seconds since the epoch)
+    pub pending_since: Option<u64>,
     /// The object has disappeared (404 on update), it is neither kept nor retried
     pub giveup: bool,
     pub conditions: Vec<ApplicationCondition>,
@@ -407,6 +420,7 @@ impl<A: ObjApi> Run<'_, A> {
                     )));
                 self.res.key = owned.key.clone();
                 self.res.pending_task = Some(task_ref.to_string());
+                self.res.pending_since = owned.pending_since;
                 self.res.pending = true;
                 return;
             }
@@ -425,6 +439,19 @@ impl<A: ObjApi> Run<'_, A> {
                 )));
             self.res.key = owned.key.clone();
         } else {
+            let limit = a.timeout_seconds.unwrap_or(DEFAULT_TASK_TIMEOUT);
+            let since = owned.pending_since.unwrap_or(self.cx.now);
+            if self.cx.now.saturating_sub(since) >= limit {
+                // Too long: give up the task so the following items are not blocked forever
+                self.res
+                    .conditions
+                    .push(ApplicationCondition::write_failed(&format!(
+                        "The task {task_ref} of write.{}.{} is still {state} after {limit}s: giving up",
+                        self.cx.group, self.cx.name
+                    )));
+                self.res.key = owned.key.clone();
+                return;
+            }
             self.res
                 .conditions
                 .push(ApplicationCondition::write_pending(&format!(
@@ -433,6 +460,7 @@ impl<A: ObjApi> Run<'_, A> {
                 )));
             self.res.key = owned.key.clone();
             self.res.pending_task = Some(task_ref.to_string());
+            self.res.pending_since = Some(since);
             self.res.pending = true;
         }
     }
@@ -450,13 +478,17 @@ impl<A: ObjApi> Run<'_, A> {
             Err(e) => {
                 // An empty answer is fine when the key is known or read back
                 if !matches!(e, CoreError::JsonError(_)) || (cx.read_path.is_none() && static_key.is_none()) {
+                    // Nothing has been created (e.g. 409 on an existing object that is not
+                    // adopted): no key, so the object does not become ours
                     self.fail("Creating", &e);
+                    return;
                 }
                 json!({})
             }
         };
         if let Some(task) = self.task_of(&obj) {
             self.res.obj = json!({});
+            self.res.pending_since = Some(cx.now);
             self.res.key = static_key.unwrap_or_default();
             self.res
                 .conditions
@@ -524,6 +556,7 @@ impl<A: ObjApi> Run<'_, A> {
                     cx.group, cx.name
                 )));
             self.res.pending_task = Some(task);
+            self.res.pending_since = Some(cx.now);
             self.res.pending = true;
             return;
         }
@@ -557,6 +590,25 @@ pub fn process_item<A: ObjApi>(
             ..ItemResult::default()
         },
     };
+    // 0. A typo in a query would silently turn the diff into "always different"
+    if cx.diff != DiffMode::None {
+        for (what, q) in [
+            ("valuesQuery", &cx.values_query),
+            ("readValuesQuery", &cx.read_values_query),
+        ] {
+            if let Some(q) = q
+                && JsonPath::parse(q).is_err()
+            {
+                run.res
+                    .conditions
+                    .push(ApplicationCondition::write_failed(&format!(
+                        "write.{}.{} {what} is not a valid JSON path: {q}",
+                        cx.group, cx.name
+                    )));
+                return run.res;
+            }
+        }
+    }
     // 1. A task left by a previous reconcile is followed before anything else
     if let Some(o) = owned
         && let Some(t) = o.pending_task.clone()
@@ -735,6 +787,7 @@ mod tests {
             update_method: UpdateMethod::Patch,
             async_write: None,
             base_path: String::new(),
+            now: 1000,
         }
     }
     fn owned(key: &str, task: Option<&str>) -> OwnedRestPoint {
@@ -967,6 +1020,7 @@ mod tests {
             done: vec!["completed".into()],
             failed: vec!["failed".into(), "canceled".into()],
             result_path: Some("$.created_resources[0]".into()),
+            timeout_seconds: None,
         });
         c.key_is_path = true;
         c.key_name = "pulp_href".into();
@@ -1018,6 +1072,44 @@ mod tests {
         assert!(!r.pending && failed(&r));
         assert!(r.conditions[0].message.contains("boom"));
         assert_eq!(r.key, "remotes/file/1/");
+    }
+
+    #[test]
+    fn failed_create_with_static_key_does_not_take_ownership() {
+        let mut c = cx();
+        c.static_key = Some("app".into());
+        let mut api = Fake::new(|_, _, _| Err(CoreError::MethodFailed("Post".into(), 409, "exists".into())));
+        let r = process_item(&mut api, &c, None, &json!({"a": 1}));
+        assert!(failed(&r));
+        assert_eq!(r.key, "");
+    }
+
+    #[test]
+    fn task_running_too_long_is_given_up() {
+        let mut c = async_cx();
+        c.async_write.as_mut().unwrap().timeout_seconds = Some(60);
+        let o = owned("remotes/file/1/", Some("/pulp/api/v3/tasks/t3/")).with_pending_since(Some(900));
+        // 100s old: over the limit
+        let mut api = Fake::new(|_, _, _| Ok(json!({"state": "running"})));
+        let r = process_item(&mut api, &c, Some(&o), &json!({}));
+        assert!(!r.pending && failed(&r));
+        assert_eq!(r.pending_task, None);
+        // 10s old: still waited for, and the start time is kept
+        let o = owned("remotes/file/1/", Some("/pulp/api/v3/tasks/t3/")).with_pending_since(Some(990));
+        let r = process_item(&mut api, &c, Some(&o), &json!({}));
+        assert!(r.pending && !failed(&r));
+        assert_eq!(r.pending_since, Some(990));
+    }
+
+    #[test]
+    fn invalid_values_query_is_an_error() {
+        let mut c = cx();
+        c.diff = DiffMode::Subset;
+        c.values_query = Some("$[".into());
+        let mut api = Fake::new(|_, _, _| Ok(json!({})));
+        let r = process_item(&mut api, &c, Some(&owned("1", None)), &json!({}));
+        assert!(failed(&r));
+        assert!(api.calls.is_empty());
     }
 
     #[test]

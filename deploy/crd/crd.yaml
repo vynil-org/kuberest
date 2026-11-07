@@ -343,7 +343,9 @@ spec:
                       nullable: true
                       type: boolean
                     async:
-                      description: The API answers writes with a task to follow before the object is settled
+                      description: |-
+                        The API answers writes with a task to follow before the object is settled.
+                        Only creates and updates are followed: a DELETE answering with a task is considered done.
                       nullable: true
                       properties:
                         done:
@@ -368,6 +370,12 @@ spec:
                         taskPath:
                           description: JSON path of the task reference in the response of a write (e.g. `$.task`)
                           type: string
+                        timeoutSeconds:
+                          description: 'Seconds after which a task still running is considered failed (default: 600)'
+                          format: uint64
+                          minimum: 0.0
+                          nullable: true
+                          type: integer
                       required:
                       - done
                       - failed
@@ -392,7 +400,12 @@ spec:
                       nullable: true
                       type: string
                     diff:
-                      description: How to compare the observed object with the desired values before updating it
+                      description: |-
+                        How to compare the observed object with the desired values before updating it.
+
+                        The comparison is deliberately tolerant (provisional, to be aligned with vynil-core later):
+                        a desired `null` matches a missing key and `1` equals `1.0`. An observed object that cannot
+                        be read (404 or an empty answer) is considered absent: with `adopt` it is created.
                       enum:
                       - None
                       - Subset
@@ -405,11 +418,16 @@ spec:
                         description: writeGroupItem describe an object to maintain within
                         properties:
                           adopt:
-                            description: 'Adopt a pre-existing object (found through readPath, or at `<path>/<key>`) instead of creating it (default: group value or false)'
+                            description: 'Adopt a pre-existing object (found through readPath, or at `<path>/<key>`) instead of creating it. An existing object answering with an empty body is seen as absent and created (default: group value or false)'
                             nullable: true
                             type: boolean
                           diff:
-                            description: How to compare the observed object with the desired values before updating it
+                            description: |-
+                              How to compare the observed object with the desired values before updating it.
+
+                              The comparison is deliberately tolerant (provisional, to be aligned with vynil-core later):
+                              a desired `null` matches a missing key and `1` equals `1.0`. An observed object that cannot
+                              be read (404 or an empty answer) is considered absent: with `adopt` it is created.
                             enum:
                             - None
                             - Subset
@@ -443,7 +461,9 @@ spec:
                             description: configuration of this object (yaml format, use handlebars to generate your needed values)
                             type: string
                           valuesQuery:
-                            description: JSON path applied on the rendered values before the comparison (diff)
+                            description: |-
+                              JSON path applied on the rendered values before the comparison (diff). An invalid path is an error;
+                              a path matching nothing (or several values) compares the whole value, i.e. the object is updated
                             nullable: true
                             type: string
                         required:
@@ -609,6 +629,12 @@ spec:
                     path:
                       description: Object path within the client
                       type: string
+                    pendingSince:
+                      description: When that task has been started (seconds since the epoch)
+                      format: uint64
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
                     pendingTask:
                       description: Reference of the asynchronous task still running for this object
                       nullable: true
