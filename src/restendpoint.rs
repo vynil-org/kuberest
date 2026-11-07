@@ -1576,7 +1576,7 @@ impl RestEndPoint {
                 let new_status = Patch::Apply(json!({
                     "apiVersion": "kuberest.solidite.fr/v1",
                     "kind": "RestEndPoint",
-                    "status": RestEndPointStatus { conditions, generation: self.metadata.generation.unwrap_or(1), owned: self.owned(), owned_target: self.owned_target() }
+                    "status": RestEndPointStatus { conditions, generation: self.metadata.generation.unwrap_or(1), owned: self.owned(), owned_target: target_new }
                 }));
                 let ps = PatchParams::apply(RESTPATH_FINALIZER).force();
                 let _o = restendpoints
