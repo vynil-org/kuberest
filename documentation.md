@@ -160,18 +160,26 @@ spec:
   client:
     keyName: id
     teardown: true
-    updateMethod: Put
+    createMethod: Post
+    readMethod: Get
+    updateMethod: Patch
+    deleteMethod: Delete
     childrenNoSubKey: false
+    keyIsPath: false
 ```
 
 | key | default | description |
 |---  |---      |--- |
 |keyName  | id | the key in the returned object that identify the object
 |teardown | true | Should the created objects (writes section) be deleted when then `RestEndpoint` is deleted
-|updateMethod | `Put` | Updating the objects with which HTTP primitive. Available values: `Put`, `Patch` and `Post`.
+|createMethod | `Post` | Creating the objects with which HTTP primitive. Available values: `Post`, `Put`.
+|readMethod | `Get` | Reading the objects with which HTTP primitive. Available values: `Get` and `Post` (see [reading with `Post`](#reading-with-post)).
+|updateMethod | `Patch` | Updating the objects with which HTTP primitive. Available values: `Put`, `Patch`, `Post` and `None` (never update).
+|deleteMethod | `Delete` | Deleting the objects with which HTTP primitive.
 |childrenNoSubKey | false | If true, updates and deletes use the **same path as create** and pass the primary key inside the request body instead of appending it to the URL. Useful for APIs that do not follow the `{collection}/{id}` pattern.
+|keyIsPath | false | If true, the key returned by the API is a full path (an `href`) used as is, relative to the `baseurl`, for updates, deletes and tasks. See [APIs keyed by href](#apis-keyed-by-href).
 
-All theses 4 keys can be overwritten per "write group" if needed.
+`keyName`, `teardown`, the methods, `childrenNoSubKey` and `keyIsPath` can be overwritten per "write group" if needed.
 
 ### Defines `read` from HTTP `Get`
 
@@ -221,6 +229,27 @@ spec:
 
 Which would set `read.projects.seb` and `read.projects.paul` with the same value as in the previous example.
 
+#### Reading with `Post`
+
+Some APIs hand out a value through a `POST` that creates nothing durable (a token, a computed result). Such a value is a read, not a write: use `read_method: Post` on the read group (or `readMethod: Post` on the client). Mind the spelling: the keys of a read group and of its items are in snake_case (`read_method`, `json_query`), unlike the client and the write groups.
+
+```yaml
+spec:
+  client:
+    baseurl: http://vault:8200/v1
+  reads:
+  - name: tools
+    path: sys/tools/random
+    read_method: Post
+    items:
+    - name: random
+      key: "16"
+      json_query: "$.data.random_bytes"
+```
+This sends a `POST` with an empty body to `<baseurl>/sys/tools/random/16`; the answer is handled exactly as a `Get` (`json_query`, `optional`, `read.<group>.<item>`).
+
+> `Post` is for `reads` only. A `writes` group always checks the existence of an object with a `Get`, whatever `readMethod` says.
+
 ### Create REST objects and get their definitions set in `write`
 
 The URL construction for writes work exactly the same as for reads. The actual key for each created object will be stored and kept to reuse on updates.
@@ -247,23 +276,126 @@ So the initial call here would make a POST to "https://gitea.your-company.com/ap
 
 #### Further writes configuration
 
-You can overwrite the behaviour of the controller for a single REST endpoint using:
+You can overwrite the behaviour of the controller for a write group using:
 ```yaml
 spec:
   writes:
   - name: application
     keyName: id
+    keyUseSlash: false
     teardown: true
-    updateMethod: Put
+    createMethod: Post
+    readMethod: Get
+    updateMethod: Patch
+    updatePath: ""
     childrenNoSubKey: false
 ```
 
 | key | default | description |
 |---  |---      |--- |
 |keyName  | id | the key in the returned object that identify the object
+|keyUseSlash | false | Should the url of an update/delete end with a slash (`<path>/<key>/`)
 |teardown | true | Should the created objects (writes section) be deleted when then `RestEndpoint` is deleted
-|updateMethod | `Put` | Updating the objects with which HTTP primitive. Available values: `Put`, `Patch` and `Post`.
+|createMethod | `Post` | `Post` or `Put`
+|readMethod | `Get` | Verb used to check that an object exists. `Post` is ignored here (`Get` is used)
+|updateMethod | `Patch` | Updating the objects with which HTTP primitive. Available values: `Put`, `Patch`, `Post` and `None` (never update).
+|updatePath | the group `path` | Path used for the updates and deletes when it differs from the creation path
 |childrenNoSubKey | false | If true, updates and deletes use the **same path as create** and pass the primary key inside the request body instead of appending it to the URL. Overrides the client-level setting.
+|keyIsPath | client value or false | The key returned by the API is a full path used as is (see [APIs keyed by href](#apis-keyed-by-href))
+|adopt | false | Default for the items, see [adopting an existing object](#adopting-an-existing-object)
+|diff | `None` | Default for the items, see [diff before update](#diff-before-update)
+|async | none | The API answers writes with a task to follow, see [asynchronous writes](#asynchronous-writes)
+
+Options of a single item:
+
+| key | default | description |
+|---  |---      |--- |
+|teardown | group value | Delete this object when the `RestEndpoint` is deleted
+|key | none | [Static key](#static-key-an-idempotent-upsert)
+|readPath | none | When the write answers without a usable body, the object is read back from this path
+|readJsonQuery | none | JSON path applied on the answer of `readPath`
+|adopt | group value | [Adopt](#adopting-an-existing-object) an object that already exists
+|diff | group value | [Compare](#diff-before-update) before updating
+|valuesQuery, readValuesQuery | none | JSON paths narrowing both sides of the comparison
+
+The keys of the objects created by `writes` are recorded as soon as they are created: if the `post` script (or any later step) fails, the next reconcile updates them instead of creating them again.
+
+##### Static key: an idempotent upsert
+
+When the API addresses an object by a name you know in advance (Vault KV, many `PUT /things/<name>` APIs), give the item a `key`. The object lives at `<path>/<key>`: create, update and delete all use that URL and no key is read from the answers (an empty `204` answer is fine).
+
+```yaml
+spec:
+  writes:
+  - name: kv
+    path: secret/data
+    createMethod: Put
+    updateMethod: Put
+    items:
+    - name: app
+      key: app
+      values: |
+        data:
+          password: s3cr3t
+```
+
+##### Diff before update
+
+Without `diff`, an object is updated at every reconcile. Some APIs create a new revision on each write (Vault KV v2 versions, for instance). With `diff`, the object is read first and only updated when it differs from the desired values:
+
+- `Subset`: every key of the desired values must match; extra keys on the remote side are ignored.
+- `Exact`: extra keys on the remote side are a difference too.
+
+The comparison is tolerant: a desired `null` matches a missing key and `1` equals `1.0`. Arrays and scalars are compared strictly. A remote object that cannot be read (404 or an empty answer) is considered absent.
+
+When the answer of a read is not shaped like the payload of a write, narrow both sides with `valuesQuery` (applied on the rendered values) and `readValuesQuery` (applied on the observed answer, default: the `readJsonQuery` result). A query that matches nothing compares the whole value, so the object is updated.
+
+```yaml
+    diff: Subset
+    items:
+    - name: app
+      key: app
+      valuesQuery: "$.data"            # the payload is {data: {...}}
+      readValuesQuery: "$.data.data"   # a KV v2 read is {data: {data: {...}, metadata: {...}}}
+```
+
+##### Adopting an existing object
+
+With `adopt: true`, an object that already exists (created by hand, or by a run whose state was lost) is taken over instead of failing with `409` or `422`. The object is searched through `readPath`, or at `<path>/<key>` with a static key, and its key is recorded. An existing object that answers with an empty body is seen as absent and is created.
+
+##### APIs keyed by href
+
+Some APIs (Pulp, for instance) identify an object by a full path returned in the answer (`pulp_href`). With `keyIsPath: true` and `keyName: pulp_href`, that value is used as is, relative to the `baseurl`, for updates, deletes and tasks.
+
+##### Asynchronous writes
+
+When the API answers a create or an update with a task to follow:
+
+```yaml
+spec:
+  writes:
+  - name: remotes
+    path: pulp/api/v3/remotes/file/file/
+    keyName: pulp_href
+    keyIsPath: true
+    async:
+      taskPath: "$.task"
+      statePath: "$.state"
+      done: [completed]
+      failed: [failed, canceled]
+      resultPath: "$.created_resources[0]"
+      timeoutSeconds: 600
+```
+
+| key | description |
+|---  |--- |
+|taskPath | JSON path of the task reference in the answer of a write
+|statePath | JSON path of the state in the task object
+|done / failed | States meaning the task finished successfully / failed
+|resultPath | JSON path, in a finished task, of the reference of the created object. Without it the object is found back through `readPath`
+|timeoutSeconds | A task still running after that delay is considered failed (default: 600)
+
+While a task runs, the `RestEndpoint` carries a `WritePending` condition and is checked again soon. Only creates and updates are followed: a `DELETE` answering with a task is considered done.
 
 #### Using `childrenNoSubKey` for non-REST-compliant APIs
 
@@ -324,6 +456,73 @@ spec:
 ```
 
 
+## Case study: HashiCorp Vault
+
+Vault is supported with token authentication: the token only has to be in the `X-Vault-Token` header, whichever way it was obtained. Complete examples are in [`examples/vault`](https://github.com/vynil-org/kuberest/tree/main/examples/vault) and run in the CI against a Vault in dev mode.
+
+```yaml
+spec:
+  inputs:
+  - name: token
+    secretRef:
+      name: vault-token
+  client:
+    baseurl: http://vault:8200/v1
+    headers:
+      X-Vault-Token: '{{ base64_decode input.token.data.token }}'
+```
+
+### Reading a KV v2 secret
+
+A KV v2 read is shaped `{data: {data: {...}, metadata: {...}}}`: `json_query` narrows it down to the secret.
+
+```yaml
+spec:
+  reads:
+  - name: kv
+    path: secret/data
+    items:
+    - name: app
+      key: from-vault
+      json_query: "$.data.data"
+  outputs:
+  - kind: Secret
+    metadata:
+      name: from-vault
+    data:
+      password: "{{ read.kv.app.password }}"
+```
+
+### Writing a KV v2 secret
+
+Every write to KV v2 creates a new version, even with identical data, and a write answers `200` with metadata or `204` with an empty body. A static `key` plus `diff: Subset` keeps a single version as long as nothing changes, and corrects a manual change made in Vault at the next reconcile:
+
+```yaml
+spec:
+  writes:
+  - name: kv
+    path: secret/data
+    createMethod: Put
+    updateMethod: Put
+    diff: Subset
+    items:
+    - name: app
+      key: app
+      valuesQuery: "$.data"
+      readValuesQuery: "$.data.data"
+      values: |
+        data:
+        {{#each input.src.data}}
+          {{@key}}: {{{ json_to_str (base64_decode this) }}}
+        {{/each}}
+```
+
+On teardown the secret is deleted (`DELETE secret/data/app`, which deletes the latest version). To destroy all the versions, use `secret/metadata` in a `teardown` script.
+
+### Values handed out by a POST
+
+`sys/tools/random/<bytes>` answers a `POST` with random bytes and stores nothing: read it with `read_method: Post` (see [reading with `Post`](#reading-with-post)).
+
 ## Available helpers for *handlebars* templates
 
 ### From dependencies
@@ -354,6 +553,8 @@ All rhai scripts (init/pre/post/teardown) are expected to return a `Map`, so the
 #{}
 ```
 This is an empty `Map` in the rhai language. Failing to return a `Map` will stop the process. Errors are documented in the conditions of the `RestEndpoint`.
+
+> *Pitfall*: a reserved word of the language used as a key of a map literal (`#{ private: true }`) fails with `ErrorParsing(PropertyExpected, ...)`. Quote the key: `#{ "private": true }`.
 
 ### `pre` script usage
 
