@@ -233,6 +233,18 @@ jobs:
           kubectl apply -f examples/vault/read-kv.yaml
           kubectl wait --for=condition=ready rep/vault-read-kv --timeout=60s
           test "$(kubectl get secret from-vault -ojsonpath='{.data.password}' | base64 -d)" = "s3cr3t"
+          # a read with POST (read_method: Post): a value from a POST that stores nothing
+          kubectl apply -f examples/vault/read-post.yaml
+          kubectl wait --for=condition=ready rep/vault-read-post --timeout=60s
+          test -n "$(kubectl get secret vault-random -ojsonpath='{.data.random}' | base64 -d)"
+          # the key of a write is kept when the post script fails (#31)
+          kubectl apply -f examples/abuses/post-fails-keeps-keys.yaml
+          for i in $(seq 1 30); do
+            [ "$(kubectl get rep vault-post-fails -o jsonpath='{.status.ownedTarget[0].key}')" = "keep" ] && break
+            sleep 2
+          done
+          test "$(kubectl get rep vault-post-fails -o jsonpath='{.status.ownedTarget[0].key}')" = "keep"
+          kubectl delete rep vault-post-fails --timeout=60s
           # teardown deletes what the RestEndPoint wrote
           kubectl delete rep vault-write-kv --timeout=60s
           if $VAULT kv get -field=password secret/app; then echo "secret/app still readable"; exit 1; fi

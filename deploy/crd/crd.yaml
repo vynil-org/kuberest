@@ -90,6 +90,7 @@ spec:
                     description: Read verb accepted by [`RestClient::obj_read`].
                     enum:
                     - Get
+                    - Post
                     nullable: true
                     type: string
                   serverCa:
@@ -297,6 +298,7 @@ spec:
                       description: Read verb accepted by [`RestClient::obj_read`].
                       enum:
                       - Get
+                      - Post
                       nullable: true
                       type: string
                   required:
@@ -493,6 +495,7 @@ spec:
                       description: Read verb accepted by [`RestClient::obj_read`].
                       enum:
                       - Get
+                      - Post
                       nullable: true
                       type: string
                     teardown:
