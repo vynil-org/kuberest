@@ -78,6 +78,10 @@ spec:
                     description: Headers to use on each requests to the endpoint
                     nullable: true
                     type: object
+                  keyIsPath:
+                    description: 'If true, the key returned by the API is a full path (href) used as is, relative to the baseurl, for updates, deletes and tasks (default: false)'
+                    nullable: true
+                    type: boolean
                   keyName:
                     description: 'keyName: the key of the object (default: id)'
                     nullable: true
@@ -334,6 +338,50 @@ spec:
                 items:
                   description: writeGroup describe a rest endpoint within the client sub-paths,
                   properties:
+                    adopt:
+                      description: 'Default for the items: adopt a pre-existing object instead of creating it (default: false)'
+                      nullable: true
+                      type: boolean
+                    async:
+                      description: |-
+                        The API answers writes with a task to follow before the object is settled.
+                        Only creates and updates are followed: a DELETE answering with a task is considered done.
+                      nullable: true
+                      properties:
+                        done:
+                          description: States meaning the task is finished successfully (e.g. `[completed]`)
+                          items:
+                            type: string
+                          type: array
+                        failed:
+                          description: States meaning the task has failed (e.g. `[failed, canceled]`)
+                          items:
+                            type: string
+                          type: array
+                        resultPath:
+                          description: |-
+                            JSON path, in a finished task, of the reference of the created object (e.g. `$.created_resources[0]`).
+                            Without it the object is found back through the item's readPath.
+                          nullable: true
+                          type: string
+                        statePath:
+                          description: JSON path of the state in the task object (e.g. `$.state`)
+                          type: string
+                        taskPath:
+                          description: JSON path of the task reference in the response of a write (e.g. `$.task`)
+                          type: string
+                        timeoutSeconds:
+                          description: 'Seconds after which a task still running is considered failed (default: 600)'
+                          format: uint64
+                          minimum: 0.0
+                          nullable: true
+                          type: integer
+                      required:
+                      - done
+                      - failed
+                      - statePath
+                      - taskPath
+                      type: object
                     childrenNoSubKey:
                       description: 'If true, updates and deletes use the same path as create and include the primary key in the payload (default: client value or false)'
                       nullable: true
@@ -351,11 +399,45 @@ spec:
                       - Delete
                       nullable: true
                       type: string
+                    diff:
+                      description: |-
+                        How to compare the observed object with the desired values before updating it.
+
+                        The comparison is deliberately tolerant (provisional, to be aligned with vynil-core later):
+                        a desired `null` matches a missing key and `1` equals `1.0`. An observed object that cannot
+                        be read (404 or an empty answer) is considered absent: with `adopt` it is created.
+                      enum:
+                      - None
+                      - Subset
+                      - Exact
+                      nullable: true
+                      type: string
                     items:
                       description: The list of object mapping
                       items:
                         description: writeGroupItem describe an object to maintain within
                         properties:
+                          adopt:
+                            description: 'Adopt a pre-existing object (found through readPath, or at `<path>/<key>`) instead of creating it. An existing object answering with an empty body is seen as absent and created (default: group value or false)'
+                            nullable: true
+                            type: boolean
+                          diff:
+                            description: |-
+                              How to compare the observed object with the desired values before updating it.
+
+                              The comparison is deliberately tolerant (provisional, to be aligned with vynil-core later):
+                              a desired `null` matches a missing key and `1` equals `1.0`. An observed object that cannot
+                              be read (404 or an empty answer) is considered absent: with `adopt` it is created.
+                            enum:
+                            - None
+                            - Subset
+                            - Exact
+                            nullable: true
+                            type: string
+                          key:
+                            description: 'Static key (handlebars): the object lives at `<path>/<key>`; create, update and delete use that url and no key is read from the answers'
+                            nullable: true
+                            type: string
                           name:
                             description: 'name of the item (used for handlebars renders: write.<group>.<name>)'
                             type: string
@@ -367,6 +449,10 @@ spec:
                             description: If writes doesnt return values, use this read query to re-read
                             nullable: true
                             type: string
+                          readValuesQuery:
+                            description: 'JSON path applied on the observed answer before the comparison (diff). Default: the readJsonQuery result'
+                            nullable: true
+                            type: string
                           teardown:
                             description: 'Delete the Object on RestEndPoint deletion (default: true, inability to do so will block RestEndPoint)'
                             nullable: true
@@ -374,11 +460,21 @@ spec:
                           values:
                             description: configuration of this object (yaml format, use handlebars to generate your needed values)
                             type: string
+                          valuesQuery:
+                            description: |-
+                              JSON path applied on the rendered values before the comparison (diff). An invalid path is an error;
+                              a path matching nothing (or several values) compares the whole value, i.e. the object is updated
+                            nullable: true
+                            type: string
                         required:
                         - name
                         - values
                         type: object
                       type: array
+                    keyIsPath:
+                      description: 'If true, the key returned by the API is a full path (href) used as is, relative to the baseurl (default: client value or false)'
+                      nullable: true
+                      type: boolean
                     keyName:
                       description: 'keyName: the key of the object (default: id)'
                       nullable: true
@@ -463,6 +559,7 @@ spec:
                       - ReadMissing
                       - ReReadFailed
                       - WriteFailed
+                      - WritePending
                       - WriteDeleteFailed
                       - WriteAlreadyExist
                       - OutputFailed
@@ -518,6 +615,10 @@ spec:
                     key:
                       description: Object key
                       type: string
+                    keyIsPath:
+                      description: If true, the key is a path relative to the baseurl and replaces the path
+                      nullable: true
+                      type: boolean
                     keyName:
                       description: 'Key field name used for payload construction (default: id)'
                       nullable: true
@@ -527,6 +628,16 @@ spec:
                       type: string
                     path:
                       description: Object path within the client
+                      type: string
+                    pendingSince:
+                      description: When that task has been started (seconds since the epoch)
+                      format: uint64
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
+                    pendingTask:
+                      description: Reference of the asynchronous task still running for this object
+                      nullable: true
                       type: string
                     teardown:
                       description: should we manage this object deletion

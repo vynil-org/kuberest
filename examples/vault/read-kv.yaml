@@ -1,0 +1,32 @@
+# Read a Vault KV v2 secret into a Kubernetes Secret (Vault -> Kubernetes).
+#
+# The token comes from a Secret: whatever the way it was obtained (root token, a token
+# created for the purpose, ...), kuberest only needs it in the X-Vault-Token header.
+# A KV v2 read is shaped `{data: {data: {...}, metadata: {...}}}`: `json_query` narrows it down.
+apiVersion: kuberest.solidite.fr/v1
+kind: RestEndPoint
+metadata:
+  name: vault-read-kv
+spec:
+  checkFrequency: 60
+  inputs:
+  - name: token
+    secretRef:
+      name: vault-token
+  client:
+    baseurl: http://vault:8200/v1
+    headers:
+      X-Vault-Token: '{{ base64_decode input.token.data.token }}'
+  reads:
+  - name: kv
+    path: secret/data
+    items:
+    - name: app
+      key: from-vault
+      json_query: "$.data.data"
+  outputs:
+  - kind: Secret
+    metadata:
+      name: from-vault
+    data:
+      password: "{{ read.kv.app.password }}"

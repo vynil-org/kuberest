@@ -4,6 +4,7 @@ use crate::{
     passwordhandler::Passwords,
     rhaihandler::Script,
     telemetry, template, update,
+    writes::{self, AsyncWrite, DiffMode, ItemCtx},
 };
 use chrono::{self, DateTime, Utc};
 use futures::StreamExt;
@@ -124,6 +125,8 @@ pub struct WebClient {
     pub client_cert: Option<String>,
     /// If true, updates and deletes use the same path as create and include the primary key in the payload (default: false)
     pub children_no_sub_key: Option<bool>,
+    /// If true, the key returned by the API is a full path (href) used as is, relative to the baseurl, for updates, deletes and tasks (default: false)
+    pub key_is_path: Option<bool>,
 }
 impl Default for WebClient {
     fn default() -> Self {
@@ -140,6 +143,7 @@ impl Default for WebClient {
             client_cert: None,
             client_key: None,
             children_no_sub_key: Some(false),
+            key_is_path: None,
         }
     }
 }
@@ -183,6 +187,17 @@ pub struct WriteGroupItem {
     pub read_path: Option<String>,
     /// If writes doesnt return values, (only used when readPath is specified too)
     pub read_json_query: Option<String>,
+    /// Static key (handlebars): the object lives at `<path>/<key>`; create, update and delete use that url and no key is read from the answers
+    pub key: Option<String>,
+    /// Adopt a pre-existing object (found through readPath, or at `<path>/<key>`) instead of creating it. An existing object answering with an empty body is seen as absent and created (default: group value or false)
+    pub adopt: Option<bool>,
+    /// Compare the observed object with the values before updating it (default: group value or None)
+    pub diff: Option<DiffMode>,
+    /// JSON path applied on the rendered values before the comparison (diff). An invalid path is an error;
+    /// a path matching nothing (or several values) compares the whole value, i.e. the object is updated
+    pub values_query: Option<String>,
+    /// JSON path applied on the observed answer before the comparison (diff). Default: the readJsonQuery result
+    pub read_values_query: Option<String>,
 }
 /// writeGroup describe a rest endpoint within the client sub-paths,
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug, JsonSchema)]
@@ -212,6 +227,16 @@ pub struct WriteGroup {
     teardown: Option<bool>,
     /// If true, updates and deletes use the same path as create and include the primary key in the payload (default: client value or false)
     pub children_no_sub_key: Option<bool>,
+    /// If true, the key returned by the API is a full path (href) used as is, relative to the baseurl (default: client value or false)
+    pub key_is_path: Option<bool>,
+    /// Default for the items: adopt a pre-existing object instead of creating it (default: false)
+    pub adopt: Option<bool>,
+    /// Default for the items: compare the observed object with the values before updating it (default: None)
+    pub diff: Option<DiffMode>,
+    /// The API answers writes with a task to follow before the object is settled.
+    /// Only creates and updates are followed: a DELETE answering with a task is considered done.
+    #[serde(rename = "async")]
+    pub async_write: Option<AsyncWrite>,
 }
 
 /// metadata describe a rest endpoint within the client sub-paths
@@ -273,6 +298,7 @@ pub enum ConditionsType {
     ReadMissing,
     ReReadFailed,
     WriteFailed,
+    WritePending,
     WriteDeleteFailed,
     WriteAlreadyExist,
     OutputFailed,
@@ -376,6 +402,10 @@ impl ApplicationCondition {
         ApplicationCondition::new(message, ConditionsStatus::True, ConditionsType::ReReadFailed)
     }
 
+    pub fn write_pending(message: &str) -> ApplicationCondition {
+        ApplicationCondition::new(message, ConditionsStatus::True, ConditionsType::WritePending)
+    }
+
     pub fn write_delete_failed(message: &str) -> ApplicationCondition {
         ApplicationCondition::new(message, ConditionsStatus::True, ConditionsType::WriteDeleteFailed)
     }
@@ -452,6 +482,12 @@ pub struct OwnedRestPoint {
     pub children_no_sub_key: Option<bool>,
     /// Key field name used for payload construction (default: id)
     pub key_name: Option<String>,
+    /// If true, the key is a path relative to the baseurl and replaces the path
+    pub key_is_path: Option<bool>,
+    /// Reference of the asynchronous task still running for this object
+    pub pending_task: Option<String>,
+    /// When that task has been started (seconds since the epoch)
+    pub pending_since: Option<u64>,
 }
 impl OwnedRestPoint {
     #[must_use]
@@ -472,6 +508,37 @@ impl OwnedRestPoint {
             teardown,
             children_no_sub_key: Some(children_no_sub_key),
             key_name: Some(key_name.to_string()),
+            key_is_path: None,
+            pending_task: None,
+            pending_since: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_key_is_path(mut self, key_is_path: bool) -> OwnedRestPoint {
+        self.key_is_path = Some(key_is_path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_pending_task(mut self, task: Option<String>) -> OwnedRestPoint {
+        self.pending_task = task;
+        self
+    }
+
+    #[must_use]
+    pub fn with_pending_since(mut self, since: Option<u64>) -> OwnedRestPoint {
+        self.pending_since = since;
+        self
+    }
+
+    /// The (path, key) pair to give to `obj_delete`
+    #[must_use]
+    pub fn delete_target(&self) -> (String, String) {
+        if self.key_is_path.unwrap_or(false) {
+            (self.key.clone(), String::new())
+        } else {
+            (self.path.clone(), self.key.clone())
         }
     }
 }
@@ -1030,14 +1097,15 @@ impl RestEndPoint {
         rhai.set_dynamic("values", &values);
 
         // Setup the httpClient
-        let mut rest = RestClient::new(&template!(
+        let base_url = template!(
             self.spec.client.baseurl.clone().as_str(),
             hbs,
             &values,
             conditions,
             recorder,
             &obj_ref
-        ));
+        );
+        let mut rest = RestClient::new(&base_url);
         if let Some(headers) = self.spec.client.headers.clone() {
             for (key, value) in headers {
                 rest.add_header(
@@ -1237,17 +1305,35 @@ impl RestEndPoint {
         // Handle each Writes
         let mut target_new: Vec<OwnedRestPoint> = Vec::new();
         let mut failures: i32 = 0;
-        if let Some(writes) = self.spec.writes.clone() {
-            for group in writes {
+        // An item waiting for an asynchronous task stops the following ones
+        let mut blocked = false;
+        let base_path = writes::base_path_of(&base_url);
+        if let Some(writes_spec) = self.spec.writes.clone() {
+            for group in writes_spec {
                 let key_name = group
                     .key_name
+                    .clone()
                     .unwrap_or(self.spec.client.key_name.clone().unwrap_or("id".to_string()));
                 let children_no_sub_key = group
                     .children_no_sub_key
                     .unwrap_or(self.spec.client.children_no_sub_key.unwrap_or(false));
+                let key_is_path = group
+                    .key_is_path
+                    .unwrap_or(self.spec.client.key_is_path.unwrap_or(false));
                 values["write"][group.name.clone()] = serde_json::json!({});
                 let path = template!(group.path.as_str(), hbs, &values, conditions, recorder, &obj_ref);
-                for item in group.items {
+                for item in group.items.clone() {
+                    let old = self
+                        .owned_target()
+                        .into_iter()
+                        .find(|t| t.group == group.name && t.name == item.name);
+                    if blocked {
+                        // Keep what we already own, the pending item comes first
+                        if let Some(o) = old {
+                            target_new.push(o);
+                        }
+                        continue;
+                    }
                     let cur_len = conditions.len();
                     let vals = serde_yaml::from_str(
                         template!(item.values.as_str(), hbs, &values, conditions, recorder, &obj_ref)
@@ -1263,238 +1349,70 @@ impl RestEndPoint {
                         )));
                         json!({})
                     });
-                    let mut giveup = false;
-                    if conditions.len() == cur_len {
-                        let key = if self
-                            .owned_target()
+                    let static_key = item
+                        .key
+                        .as_ref()
+                        .map(|k| template!(k.as_str(), hbs, &values, conditions, recorder, &obj_ref));
+                    if conditions.len() != cur_len {
+                        continue;
+                    }
+                    let cx = ItemCtx {
+                        group: group.name.clone(),
+                        name: item.name.clone(),
+                        path: path.clone(),
+                        update_path: group.update_path.clone(),
+                        key_name: key_name.clone(),
+                        key_use_slash: group.key_use_slash.unwrap_or(false),
+                        key_is_path,
+                        children_no_sub_key,
+                        static_key,
+                        adopt: item.adopt.or(group.adopt).unwrap_or(false),
+                        diff: item.diff.clone().or(group.diff.clone()).unwrap_or_default(),
+                        values_query: item.values_query.clone(),
+                        read_values_query: item.read_values_query.clone(),
+                        read_path: item.read_path.clone(),
+                        read_json_query: item.read_json_query.clone(),
+                        create_method: group.create_method.clone().unwrap_or(
+                            self.spec
+                                .client
+                                .create_method
+                                .clone()
+                                .unwrap_or(CreateMethod::Post),
+                        ),
+                        read_method: group
+                            .read_method
                             .clone()
-                            .into_iter()
-                            .any(|t| t.group == group.name && t.name == item.name)
-                        {
-                            // Update the object
-                            let myself = self
-                                .owned_target()
+                            .unwrap_or(self.spec.client.read_method.clone().unwrap_or(ReadMethod::Get)),
+                        update_method: group.update_method.clone().unwrap_or(
+                            self.spec
+                                .client
+                                .update_method
                                 .clone()
-                                .into_iter()
-                                .find(|t| t.group == group.name && t.name == item.name)
-                                .unwrap();
-                            if myself.key.is_empty() {
-                                conditions.push(ApplicationCondition::write_failed(&format!(
-                                    "Will *not* update write.{}.{} with an empty key",
-                                    group.name.clone(),
-                                    item.name
-                                )));
-                                "".to_string()
-                            } else {
-                                let (update_path, update_key, update_vals) = if children_no_sub_key {
-                                    let mut merged = vals.clone();
-                                    merged[key_name.clone()] = json!(myself.key);
-                                    (path.clone(), "".to_string(), merged)
-                                } else {
-                                    (
-                                        group.update_path.clone().unwrap_or(path.clone()),
-                                        myself.key.clone(),
-                                        vals.clone(),
-                                    )
-                                };
-                                let mut obj = rest
-                                    .clone()
-                                    .obj_update(
-                                        group.update_method.clone().unwrap_or(
-                                            self.spec
-                                                .client
-                                                .update_method
-                                                .clone()
-                                                .unwrap_or(UpdateMethod::Patch),
-                                        ),
-                                        update_path.as_str(),
-                                        &update_key,
-                                        &update_vals,
-                                        false,
-                                    )
-                                    .unwrap_or_else(|e| {
-                                        giveup = if let vynil_core::Error::MethodFailed(_, code, _) = e {
-                                            code == 404
-                                        } else {
-                                            false
-                                        };
-                                        match e {
-                                            vynil_core::Error::JsonError(_) => {
-                                                if item.read_path.is_none() {
-                                                    conditions.push(ApplicationCondition::write_failed(
-                                                        &format!(
-                                                            "Updating write.{}.{} raised {e:?}",
-                                                            group.name.clone(),
-                                                            item.name
-                                                        ),
-                                                    ));
-                                                }
-                                            }
-                                            _ => {
-                                                conditions.push(ApplicationCondition::write_failed(
-                                                    &format!(
-                                                        "Updating write.{}.{} raised {e:?}",
-                                                        group.name.clone(),
-                                                        item.name
-                                                    ),
-                                                ));
-                                            }
-                                        }
-                                        json!({})
-                                    });
-                                if let Some(read_path) = item.read_path.clone() {
-                                    let my_read = rest
-                                        .clone()
-                                        .obj_read(
-                                            group.read_method.clone().unwrap_or(
-                                                self.spec
-                                                    .client
-                                                    .read_method
-                                                    .clone()
-                                                    .unwrap_or(ReadMethod::Get),
-                                            ),
-                                            read_path.as_str(),
-                                            "",
-                                        )
-                                        .unwrap_or_else(|e| {
-                                            conditions.push(ApplicationCondition::reread_failed(&format!(
-                                                "Reading back write.{}.{} raised {e:?}",
-                                                group.name.clone(),
-                                                item.name
-                                            )));
-                                            json!({})
-                                        });
-                                    obj = my_read.clone();
-                                    if let Some(json_path) = item.read_json_query.clone() {
-                                        let _ = JsonPath::parse(&json_path).map(|path| {
-                                            obj = path
-                                                .query(&my_read)
-                                                .at_most_one()
-                                                .unwrap_or(Some(&my_read))
-                                                .unwrap_or(&my_read)
-                                                .clone();
-                                        });
-                                    }
-                                }
-                                values["write"][group.name.clone()][item.name.clone()] = obj.clone();
-                                let key_name_moved = key_name.clone();
-                                if obj[key_name.clone()].is_i64() {
-                                    obj[key_name.clone()].as_i64().unwrap().to_string()
-                                } else if obj[key_name.clone()].is_u64() {
-                                    obj[key_name.clone()].as_u64().unwrap().to_string()
-                                } else if obj[key_name.clone()].is_number() {
-                                    obj[key_name.clone()].as_number().unwrap().to_string()
-                                } else {
-                                    obj[key_name.clone()].as_str().unwrap_or_else(|| {
-                                        conditions.push(ApplicationCondition::write_failed(&format!("While updating write.{}.{} {} is neither a number or a string in {:}",group.name.clone(),item.name,key_name_moved,obj)));
-                                        ""
-                                    }).to_string()
-                                }
-                            }
+                                .unwrap_or(UpdateMethod::Patch),
+                        ),
+                        async_write: group.async_write.clone(),
+                        base_path: base_path.clone(),
+                        now: chrono::Utc::now().timestamp().unsigned_abs(),
+                    };
+                    let mut api = rest.clone();
+                    let res = writes::process_item(&mut api, &cx, old.as_ref(), &vals);
+                    values["write"][group.name.clone()][item.name.clone()] = res.obj.clone();
+                    conditions.extend(res.conditions);
+                    if res.pending {
+                        blocked = true;
+                    }
+                    if res.giveup {
+                        failures += 1;
+                    } else if !res.key.is_empty() || res.pending_task.is_some() {
+                        let owned_path = if children_no_sub_key {
+                            path.clone()
                         } else {
-                            // Create the object
-                            let tmp = format!("{path}/");
-                            let my_path = if group.key_use_slash.unwrap_or(false) {
-                                tmp.as_str()
-                            } else {
-                                path.as_str()
-                            };
-                            let mut obj = rest
-                                .clone()
-                                .obj_create(
-                                    group.create_method.clone().unwrap_or(
-                                        self.spec
-                                            .client
-                                            .create_method
-                                            .clone()
-                                            .unwrap_or(CreateMethod::Post),
-                                    ),
-                                    my_path,
-                                    &vals,
-                                )
-                                .unwrap_or_else(|e| {
-                                    match e {
-                                        vynil_core::Error::JsonError(_) => {
-                                            if item.read_path.is_none() {
-                                                conditions.push(ApplicationCondition::write_failed(
-                                                    &format!(
-                                                        "Creating write.{}.{} raised {e:?}",
-                                                        group.name.clone(),
-                                                        item.name
-                                                    ),
-                                                ));
-                                            }
-                                        }
-                                        _ => {
-                                            conditions.push(ApplicationCondition::write_failed(&format!(
-                                                "Creating write.{}.{} raised {e:?}",
-                                                group.name.clone(),
-                                                item.name
-                                            )));
-                                        }
-                                    }
-                                    json!({})
-                                });
-                            if let Some(read_path) = item.read_path.clone() {
-                                let my_read = rest
-                                    .clone()
-                                    .obj_read(
-                                        group.read_method.clone().unwrap_or(
-                                            self.spec.client.read_method.clone().unwrap_or(ReadMethod::Get),
-                                        ),
-                                        read_path.as_str(),
-                                        "",
-                                    )
-                                    .unwrap_or_else(|e| {
-                                        conditions.push(ApplicationCondition::reread_failed(&format!(
-                                            "Reading back write.{}.{} raised {e:?}",
-                                            group.name.clone(),
-                                            item.name
-                                        )));
-                                        json!({})
-                                    });
-                                obj = my_read.clone();
-                                if let Some(json_path) = item.read_json_query.clone() {
-                                    let _ = JsonPath::parse(&json_path).map(|path| {
-                                        obj = path
-                                            .query(&my_read)
-                                            .at_most_one()
-                                            .unwrap_or(Some(&my_read))
-                                            .unwrap_or(&my_read)
-                                            .clone();
-                                    });
-                                }
-                            }
-                            values["write"][group.name.clone()][item.name.clone()] = obj.clone();
-                            let key_name_moved = key_name.clone();
-                            if obj[key_name.clone()].is_i64() {
-                                obj[key_name.clone()].as_i64().unwrap().to_string()
-                            } else if obj[key_name.clone()].is_u64() {
-                                obj[key_name.clone()].as_u64().unwrap().to_string()
-                            } else if obj[key_name.clone()].is_number() {
-                                obj[key_name.clone()].as_number().unwrap().to_string()
-                            } else {
-                                obj[key_name.clone()].as_str().unwrap_or_else(|| {
-                                    conditions.push(ApplicationCondition::write_failed(&format!("While creating write.{}.{} {} is neither a number or a string in {:}",group.name.clone(),item.name,key_name_moved,obj)));
-                                    ""
-                                }).to_string()
-                            }
+                            group.update_path.clone().unwrap_or(path.clone())
                         };
-                        if !giveup && !key.is_empty() {
-                            let tmp = format!("{key}/");
-                            let my_key = if group.key_use_slash.unwrap_or(false) {
-                                tmp.as_str()
-                            } else {
-                                key.as_str()
-                            };
-                            let owned_path = if children_no_sub_key {
-                                path.clone()
-                            } else {
-                                group.update_path.clone().unwrap_or(path.clone())
-                            };
-                            target_new.push(OwnedRestPoint::new(
+                        target_new.push(
+                            OwnedRestPoint::new(
                                 owned_path.as_str(),
-                                my_key,
+                                res.key.as_str(),
                                 group.name.as_str(),
                                 item.name.as_str(),
                                 item.teardown.unwrap_or(
@@ -1504,16 +1422,17 @@ impl RestEndPoint {
                                 ),
                                 children_no_sub_key,
                                 key_name.as_str(),
-                            ));
-                        } else if giveup {
-                            failures += 1;
-                        }
+                            )
+                            .with_key_is_path(key_is_path)
+                            .with_pending_task(res.pending_task)
+                            .with_pending_since(res.pending_since),
+                        );
                     }
                 }
             }
         }
         // Delete old owned writes if no failures
-        if failures == 0 {
+        if failures == 0 && !blocked {
             for old in self.owned_target().clone() {
                 if old.teardown
                     && !target_new
@@ -1529,7 +1448,10 @@ impl RestEndPoint {
                             &json!({del_key_name: old.key}),
                         )
                     } else {
-                        rest.obj_delete(DeleteMethod::Delete, &old.path, &old.key)
+                        {
+                            let (dp, dk) = old.delete_target();
+                            rest.obj_delete(DeleteMethod::Delete, &dp, &dk)
+                        }
                     };
                     delete_result.unwrap_or_else(|e| {
                         let giveup = if let vynil_core::Error::MethodFailed(_, code, _) = e {
@@ -1577,16 +1499,35 @@ impl RestEndPoint {
                 && c.condition_type != ConditionsType::ReadMissing
                 && c.condition_type != ConditionsType::WriteAlreadyExist
         }) {
-            let msg = "Some writes have failed";
-            Self::publish_warning(
-                &recorder,
-                &obj_ref,
-                String::from(msg),
-                format!("Found {} error(s) while writing values", conditions.len()),
-                String::from("fail"),
-            )
-            .await?;
-            conditions.push(ApplicationCondition::not_ready(msg));
+            let only_pending = cnd.iter().all(|c| {
+                c.condition_type == ConditionsType::WritePending
+                    || c.condition_type == ConditionsType::InputMissing
+                    || c.condition_type == ConditionsType::ReadMissing
+                    || c.condition_type == ConditionsType::WriteAlreadyExist
+            });
+            if only_pending {
+                let msg = "Some writes are waiting for a task";
+                Self::publish(
+                    &recorder,
+                    &obj_ref,
+                    String::from(msg),
+                    format!("{} write(s) pending", conditions.len()),
+                    String::from("pending"),
+                )
+                .await?;
+                conditions.push(ApplicationCondition::not_ready(msg));
+            } else {
+                let msg = "Some writes have failed";
+                Self::publish_warning(
+                    &recorder,
+                    &obj_ref,
+                    String::from(msg),
+                    format!("Found {} error(s) while writing values", conditions.len()),
+                    String::from("fail"),
+                )
+                .await?;
+                conditions.push(ApplicationCondition::not_ready(msg));
+            }
             let new_status = Patch::Apply(json!({
                 "apiVersion": "kuberest.solidite.fr/v1",
                 "kind": "RestEndPoint",
@@ -2364,7 +2305,10 @@ impl RestEndPoint {
                             &json!({del_key_name: obj.key}),
                         )
                     } else {
-                        rest.obj_delete(DeleteMethod::Delete, &obj.path, &obj.key)
+                        {
+                            let (dp, dk) = obj.delete_target();
+                            rest.obj_delete(DeleteMethod::Delete, &dp, &dk)
+                        }
                     };
                     delete_result.unwrap_or_else(|e| {
                         let giveup = if let vynil_core::Error::MethodFailed(_, code, _) = e {

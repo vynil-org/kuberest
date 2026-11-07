@@ -45,7 +45,13 @@ pub fn rhai_err(e: Error) -> Box<rhai::EvalAltResult> {
 
 /// Expose all restpath components used by main
 pub mod restendpoint;
-pub use crate::restendpoint::*;
+
+/// Per-item processing of the writes
+pub mod writes;
+pub use crate::{
+    restendpoint::*,
+    writes::{AsyncWrite, DiffMode},
+};
 
 /// Log and trace integrations
 pub mod telemetry;
