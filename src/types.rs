@@ -83,11 +83,11 @@ pub struct WebClient {
     pub headers: Option<HashMap<String, String>>,
     /// keyName: the key of the object (default: id)
     pub key_name: Option<String>,
-    /// Method to use when creating an object (default: Post)
+    /// Method to use when creating an object (default: Get)
     pub create_method: Option<CreateMethod>,
-    /// Method to use when reading an object (default: Get). `Post` (empty body) is for `reads` groups only: `writes` always check existence with `Get`
+    /// Method to use when reading an object (default: Post)
     pub read_method: Option<ReadMethod>,
-    /// Method to use when updating an object (default: Patch)
+    /// Method to use when updating an object (default: Put)
     pub update_method: Option<UpdateMethod>,
     /// Method to use when deleting an object (default: Delete)
     pub delete_method: Option<DeleteMethod>,

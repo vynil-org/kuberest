@@ -107,11 +107,11 @@ pub struct WebClient {
     pub headers: Option<HashMap<String, String>>,
     /// keyName: the key of the object (default: id)
     pub key_name: Option<String>,
-    /// Method to use when creating an object (default: Get)
+    /// Method to use when creating an object (default: Post)
     pub create_method: Option<CreateMethod>,
-    /// Method to use when reading an object (default: Post)
+    /// Method to use when reading an object (default: Get). `Post` (empty body) is for `reads` groups only: `writes` always check existence with `Get`
     pub read_method: Option<ReadMethod>,
-    /// Method to use when updating an object (default: Put)
+    /// Method to use when updating an object (default: Patch)
     pub update_method: Option<UpdateMethod>,
     /// Method to use when deleting an object (default: Delete)
     pub delete_method: Option<DeleteMethod>,
@@ -167,7 +167,7 @@ pub struct ReadGroup {
     pub name: String,
     /// path appended to the client's baseurl for this group of objects
     pub path: String,
-    /// Method to use when reading an object (default: Get)
+    /// Method to use when reading an object (default: Get, or `Post` with an empty body)
     pub read_method: Option<ReadMethod>,
     /// The list of object mapping
     pub items: Vec<ReadGroupItem>,
@@ -213,7 +213,7 @@ pub struct WriteGroup {
     pub key_use_slash: Option<bool>,
     /// Method to use when creating an object (default: Post)
     pub create_method: Option<CreateMethod>,
-    /// Method to use when reading an object (default: Get)
+    /// Method to use when reading an object (default: Get). `Post` is not used here: the existence check of a write is always a `Get`
     pub read_method: Option<ReadMethod>,
     /// Method to use when updating an object (default: Patch)
     pub update_method: Option<UpdateMethod>,
