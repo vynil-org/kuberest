@@ -5,3 +5,9 @@
 # en amont mais bloquées par une dépendance épinglée y restent visibles.
 [advisories]
 ignore = []
+
+# Suivi hors audit : GHSA-w9wp-h8wv-79jx (opentelemetry_sdk <= 0.32.0, baggage W3C).
+# Pas encore d'advisory RustSec, donc rien à ignorer ici. Non atteignable (aucune
+# propagation entrante, feature `telemetry` optionnelle) ; migration OTel suivie
+# dans l'issue #36. À transformer en `ignore` motivé si un RUSTSEC-xxxx apparaît
+# avant la migration.
