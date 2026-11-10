@@ -1354,6 +1354,11 @@ impl RestEndPoint {
                         .as_ref()
                         .map(|k| template!(k.as_str(), hbs, &values, conditions, recorder, &obj_ref));
                     if conditions.len() != cur_len {
+                        // Templating failed: keep what we already own, otherwise the
+                        // cleanup below would delete it
+                        if let Some(o) = old {
+                            target_new.push(o);
+                        }
                         continue;
                     }
                     let cx = ItemCtx {

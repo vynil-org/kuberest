@@ -245,6 +245,22 @@ jobs:
           done
           test "$(kubectl get rep vault-post-fails -o jsonpath='{.status.ownedTarget[0].key}')" = "keep"
           kubectl delete rep vault-post-fails --timeout=60s
+          # a templating failure on an owned write keeps it owned and does not delete it
+          kubectl apply -f examples/abuses/write-template-fails-keeps-owned.yaml
+          kubectl wait --for=condition=ready rep/vault-template-fails --timeout=60s
+          test "$($VAULT kv get -field=a secret/tpl-keep)" = "b"
+          kubectl patch rep vault-template-fails --type=json -p '[{"op":"replace","path":"/spec/writes/0/items/0/values","value":"data: {{ broken"}]'
+          for i in $(seq 1 30); do
+            g=$(kubectl get rep vault-template-fails -o jsonpath='{.metadata.generation}')
+            [ "$(kubectl get rep vault-template-fails -o jsonpath='{.status.generation}')" = "$g" ] && break
+            sleep 2
+          done
+          sleep 10
+          test "$(kubectl get rep vault-template-fails -o jsonpath='{.status.ownedTarget[0].key}')" = "tpl-keep"
+          test "$($VAULT kv get -field=a secret/tpl-keep)" = "b"
+          # still owned: the teardown deletes it
+          kubectl delete rep vault-template-fails --timeout=60s
+          if $VAULT kv get -field=a secret/tpl-keep; then echo "secret/tpl-keep still readable"; exit 1; fi
           # teardown deletes what the RestEndPoint wrote
           kubectl delete rep vault-write-kv --timeout=60s
           if $VAULT kv get -field=password secret/app; then echo "secret/app still readable"; exit 1; fi

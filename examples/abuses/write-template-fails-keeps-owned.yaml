@@ -1,0 +1,28 @@
+# Regression: when the templating of a write item fails (transient error), the object already
+# owned is kept in the status instead of being deleted by the cleanup of the writes.
+# The e2e breaks `values` after the first successful reconcile, then checks the object is still there.
+apiVersion: kuberest.solidite.fr/v1
+kind: RestEndPoint
+metadata:
+  name: vault-template-fails
+spec:
+  retryFrequency: 5
+  inputs:
+  - name: token
+    secretRef:
+      name: vault-token
+  client:
+    baseurl: http://vault:8200/v1
+    headers:
+      X-Vault-Token: '{{ base64_decode input.token.data.token }}'
+  writes:
+  - name: kv
+    path: secret/data
+    createMethod: Put
+    updateMethod: Put
+    items:
+    - name: keep
+      key: tpl-keep
+      values: |
+        data:
+          a: b
