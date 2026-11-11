@@ -1,0 +1,33 @@
+name: Audit
+
+# Audit informatif des dépendances (advisories RustSec).
+# Ne bloque jamais un merge ni une publication : continue-on-error au niveau du job.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  schedule:
+    # Chaque lundi à 06:00 UTC
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+  checks: write
+  issues: write # indispensable : c'est ce qui crée une issue par advisory
+
+jobs:
+  audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: cargo audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
