@@ -107,11 +107,11 @@ pub struct WebClient {
     pub headers: Option<HashMap<String, String>>,
     /// keyName: the key of the object (default: id)
     pub key_name: Option<String>,
-    /// Method to use when creating an object (default: Get)
+    /// Method to use when creating an object (default: Post)
     pub create_method: Option<CreateMethod>,
-    /// Method to use when reading an object (default: Post)
+    /// Method to use when reading an object (default: Get). `Post` (empty body) is for `reads` groups only: `writes` always check existence with `Get`
     pub read_method: Option<ReadMethod>,
-    /// Method to use when updating an object (default: Put)
+    /// Method to use when updating an object (default: Patch)
     pub update_method: Option<UpdateMethod>,
     /// Method to use when deleting an object (default: Delete)
     pub delete_method: Option<DeleteMethod>,
@@ -167,7 +167,7 @@ pub struct ReadGroup {
     pub name: String,
     /// path appended to the client's baseurl for this group of objects
     pub path: String,
-    /// Method to use when reading an object (default: Get)
+    /// Method to use when reading an object (default: Get, or `Post` with an empty body)
     pub read_method: Option<ReadMethod>,
     /// The list of object mapping
     pub items: Vec<ReadGroupItem>,
@@ -213,7 +213,7 @@ pub struct WriteGroup {
     pub key_use_slash: Option<bool>,
     /// Method to use when creating an object (default: Post)
     pub create_method: Option<CreateMethod>,
-    /// Method to use when reading an object (default: Get)
+    /// Method to use when reading an object (default: Get). `Post` is not used here: the existence check of a write is always a `Get`
     pub read_method: Option<ReadMethod>,
     /// Method to use when updating an object (default: Patch)
     pub update_method: Option<UpdateMethod>,
@@ -1354,6 +1354,11 @@ impl RestEndPoint {
                         .as_ref()
                         .map(|k| template!(k.as_str(), hbs, &values, conditions, recorder, &obj_ref));
                     if conditions.len() != cur_len {
+                        // Templating failed: keep what we already own, otherwise the
+                        // cleanup below would delete it
+                        if let Some(o) = old {
+                            target_new.push(o);
+                        }
                         continue;
                     }
                     let cx = ItemCtx {
@@ -1379,10 +1384,16 @@ impl RestEndPoint {
                                 .clone()
                                 .unwrap_or(CreateMethod::Post),
                         ),
-                        read_method: group
+                        // the existence check of a write must be a side-effect free read:
+                        // `Post` is only meant for `reads` groups
+                        read_method: match group
                             .read_method
                             .clone()
-                            .unwrap_or(self.spec.client.read_method.clone().unwrap_or(ReadMethod::Get)),
+                            .unwrap_or(self.spec.client.read_method.clone().unwrap_or(ReadMethod::Get))
+                        {
+                            ReadMethod::Post => ReadMethod::Get,
+                            m => m,
+                        },
                         update_method: group.update_method.clone().unwrap_or(
                             self.spec
                                 .client
@@ -1570,7 +1581,7 @@ impl RestEndPoint {
                 let new_status = Patch::Apply(json!({
                     "apiVersion": "kuberest.solidite.fr/v1",
                     "kind": "RestEndPoint",
-                    "status": RestEndPointStatus { conditions, generation: self.metadata.generation.unwrap_or(1), owned: self.owned(), owned_target: self.owned_target() }
+                    "status": RestEndPointStatus { conditions, generation: self.metadata.generation.unwrap_or(1), owned: self.owned(), owned_target: target_new }
                 }));
                 let ps = PatchParams::apply(RESTPATH_FINALIZER).force();
                 let _o = restendpoints
