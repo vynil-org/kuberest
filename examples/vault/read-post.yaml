@@ -1,0 +1,33 @@
+# Read a value handed out by a POST that creates nothing durable (read_method: Post).
+#
+# Vault's `sys/tools/random/<bytes>` answers a POST with random bytes: nothing is stored, so
+# it is a read, not a write. `Post` is accepted on `reads` groups only (a `writes` group
+# always checks existence with `Get`).
+apiVersion: kuberest.solidite.fr/v1
+kind: RestEndPoint
+metadata:
+  name: vault-read-post
+spec:
+  checkFrequency: 3600
+  inputs:
+  - name: token
+    secretRef:
+      name: vault-token
+  client:
+    baseurl: http://vault:8200/v1
+    headers:
+      X-Vault-Token: '{{ base64_decode input.token.data.token }}'
+  reads:
+  - name: tools
+    path: sys/tools/random
+    read_method: Post
+    items:
+    - name: random
+      key: "16"
+      json_query: "$.data.random_bytes"
+  outputs:
+  - kind: Secret
+    metadata:
+      name: vault-random
+    data:
+      random: "{{ read.tools.random }}"

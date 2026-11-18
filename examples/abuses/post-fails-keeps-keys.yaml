@@ -1,0 +1,29 @@
+# Regression (#31): the keys of the objects created by `writes` are kept when `post` fails,
+# so the retry updates the object instead of creating it again ("already exists" forever).
+apiVersion: kuberest.solidite.fr/v1
+kind: RestEndPoint
+metadata:
+  name: vault-post-fails
+spec:
+  retryFrequency: 5
+  inputs:
+  - name: token
+    secretRef:
+      name: vault-token
+  client:
+    baseurl: http://vault:8200/v1
+    headers:
+      X-Vault-Token: '{{ base64_decode input.token.data.token }}'
+  writes:
+  - name: kv
+    path: secret/data
+    createMethod: Put
+    updateMethod: Put
+    items:
+    - name: keep
+      key: keep
+      values: |
+        data:
+          a: b
+  post: |
+    throw "not ready";
