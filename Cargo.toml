@@ -58,7 +58,7 @@ telemetry = ["opentelemetry-otlp"]
 kube = { version = "3.1.0", features = ["runtime", "client", "derive"] }
 k8s-openapi = { version = "0.27.1", features = ["latest", "schemars"], default-features = false }
 
-actix-web = "4.9.0"
+actix-web = { version = "4.9.0", default-features = false, features = ["macros"] }
 futures = "0.3.28"
 tokio = { version = "1.41.0", features = ["macros", "rt-multi-thread"] }
 schemars = { version = "1", features = ["chrono04"] }
