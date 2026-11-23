@@ -264,6 +264,32 @@ jobs:
           # teardown deletes what the RestEndPoint wrote
           kubectl delete rep vault-write-kv --timeout=60s
           if $VAULT kv get -field=password secret/app; then echo "secret/app still readable"; exit 1; fi
+      - name: Vault, watchInputs (a changed input Secret is followed without waiting for checkFrequency)
+        env:
+          VAULT: kubectl exec deploy/vault -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault
+        run: |
+          set -eu
+          kubectl create secret generic watch-src --from-literal=password=v1
+          kubectl apply -f examples/vault/watch-inputs.yaml
+          # the same RestEndPoint without watchInputs is the control: only checkFrequency could update it
+          sed -e 's/vault-watch/vault-nowatch/' -e 's/watchInputs: true/watchInputs: false/' -e 's/key: watch/key: nowatch/' \
+            examples/vault/watch-inputs.yaml | kubectl apply -f -
+          kubectl wait --for=condition=ready rep/vault-watch rep/vault-nowatch --timeout=60s
+          test "$($VAULT kv get -field=password secret/watch)" = "v1"
+          test "$($VAULT kv get -field=password secret/nowatch)" = "v1"
+          # checkFrequency is 1h: only the watch can explain a fast update
+          kubectl create secret generic watch-src --from-literal=password=v2 --dry-run=client -o yaml | kubectl apply -f -
+          for i in $(seq 1 30); do
+            [ "$($VAULT kv get -field=password secret/watch)" = "v2" ] && break
+            sleep 2
+          done
+          test "$($VAULT kv get -field=password secret/watch)" = "v2"
+          test "$($VAULT kv get -field=password secret/nowatch)" = "v1"
+          # no reconcile storm once settled
+          sleep 15
+          test "$(kubectl logs deploy/kuberest | grep -c 'An input changed')" -lt 5
+          test "$($VAULT kv metadata get -format=json secret/watch | jq .data.current_version)" = "2"
+          kubectl delete rep vault-watch vault-nowatch --timeout=60s
       - name: Dump the Vault e2e state on failure
         if: failure()
         run: |

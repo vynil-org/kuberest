@@ -8,23 +8,29 @@ use crate::{
 };
 use chrono::{self, DateTime, Utc};
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Namespace, ObjectReference};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, ObjectReference, Secret};
 use kube::{
     CustomResource, Resource,
     api::{Api, ListParams, Patch, PatchParams, ResourceExt},
     client::Client,
+    core::PartialObjectMeta,
     runtime::{
-        controller::{Action, Controller},
+        WatchStreamExt,
+        controller::{self, Action, Controller},
         events::{Event, EventType, Recorder, Reporter},
         finalizer::{Event as Finalizer, finalizer},
-        watcher::Config,
+        reflector::{ObjectRef, Store},
+        watcher::{Config, metadata_watcher},
     },
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json_path::JsonPath;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::{runtime::Handle, sync::RwLock, time::Duration};
 use tracing::*;
 use vynil_core::http::{CreateMethod, DeleteMethod, ReadMethod, RestClient, UpdateMethod};
@@ -588,6 +594,8 @@ pub struct RestEndPointSpec {
     pub check_frequency: Option<u64>,
     /// retryFrequency define the pooling interval if previous try have failed (in seconds, default: 300 aka 5mn)
     pub retry_frequency: Option<u64>,
+    /// watchInputs: reconcile as soon as a Secret or ConfigMap listed in `inputs` changes, instead of waiting for `checkFrequency` (default: false)
+    pub watch_inputs: Option<bool>,
     /// A rhai teardown-script for a final cleanup on RestEndPoint deletion
     pub teardown: Option<String>,
 }
@@ -610,6 +618,63 @@ pub struct Context {
     pub diagnostics: Arc<RwLock<Diagnostics>>,
     /// Prometheus metrics
     pub metrics: Metrics,
+    /// RestEndPoints woken up by a change of one of their inputs
+    pub wakeups: Wakeups,
+}
+
+/// The RestEndPoints (namespace, name) woken up by a watched input.
+///
+/// A reconcile skips the events that only come from our own status update; a wake-up
+/// must go through that guard, hence this shared set between the watchers and `reconcile`.
+#[derive(Clone, Default)]
+pub struct Wakeups(Arc<std::sync::Mutex<HashSet<(String, String)>>>);
+impl Wakeups {
+    pub fn insert(&self, ns: &str, name: &str) {
+        self.0.lock().unwrap().insert((ns.to_string(), name.to_string()));
+    }
+
+    /// Was this RestEndPoint woken up since its last reconcile ? (clears the mark)
+    pub fn take(&self, ns: &str, name: &str) -> bool {
+        self.0.lock().unwrap().remove(&(ns.to_string(), name.to_string()))
+    }
+}
+
+/// The (namespace, name) of the RestEndPoints with `watchInputs` that list the given Secret or ConfigMap in their inputs
+pub fn endpoints_using(
+    is_secret: bool,
+    ns: &str,
+    name: &str,
+    endpoints: &[Arc<RestEndPoint>],
+) -> Vec<(String, String)> {
+    endpoints
+        .iter()
+        .filter(|rep| rep.spec.watch_inputs.unwrap_or(false))
+        .filter(|rep| {
+            let rep_ns = rep.namespace().unwrap_or_default();
+            rep.spec.inputs.iter().flatten().any(|i| {
+                if is_secret {
+                    i.secret_ref
+                        .as_ref()
+                        .is_some_and(|r| r.name == name && r.namespace.as_deref().unwrap_or(&rep_ns) == ns)
+                } else {
+                    i.config_map_ref
+                        .as_ref()
+                        .is_some_and(|r| r.name == name && r.namespace.as_deref().unwrap_or(&rep_ns) == ns)
+                }
+            })
+        })
+        .map(|rep| (rep.namespace().unwrap_or_default(), rep.name_any()))
+        .collect()
+}
+
+/// Was the last write on this object made by kuberest itself (an output) ?
+/// Such an event must not wake anybody up, otherwise an output used as an input would loop.
+pub fn written_by_us(meta: &kube::api::ObjectMeta) -> bool {
+    meta.managed_fields
+        .iter()
+        .flatten()
+        .max_by_key(|f| f.time.clone())
+        .is_some_and(|f| f.manager.as_deref() == Some(RESTPATH_FINALIZER))
 }
 
 #[instrument(skip(ctx, rest_path), fields(trace_id))]
@@ -761,7 +826,13 @@ impl RestEndPoint {
     // Reconcile (for non-finalizer related changes)
     async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action> {
         // Before everything : is this reconcillation because of our last status update ?
-        if let Some(status) = self.status.clone() {
+        let woken = ctx
+            .wakeups
+            .take(&self.namespace().unwrap_or_default(), &self.name_any());
+        if woken {
+            info!("An input changed, reconciling without waiting");
+        }
+        if let Some(status) = self.status.clone().filter(|_| !woken) {
             let now = chrono::offset::Utc::now();
             if status.generation == self.metadata.generation.unwrap_or(1) {
                 let delta: u64 = (now - status.conditions[0].last_transition_time.unwrap_or(now))
@@ -2476,6 +2547,7 @@ impl State {
             client,
             metrics: Metrics::default().register(&self.registry).unwrap(),
             diagnostics: self.diagnostics.clone(),
+            wakeups: Wakeups::default(),
         })
     }
 }
@@ -2489,12 +2561,49 @@ pub async fn run(state: State) {
         info!("Installation: cargo run --bin crdgen | kubectl apply -f -");
         std::process::exit(1);
     }
-    Controller::new(restendpoints, Config::default().any_semantic())
+    let ctx = state.to_context(client.clone());
+    let controller = Controller::new(restendpoints, Config::default().any_semantic())
+        .with_config(controller::Config::default().debounce(Duration::from_secs(2)));
+    let store = controller.store();
+    // Metadata-only watches: the content of the Secrets never enters the memory of the watcher
+    let secrets = metadata_watcher(Api::<Secret>::all(client.clone()), Config::default()).touched_objects();
+    let configmaps =
+        metadata_watcher(Api::<ConfigMap>::all(client.clone()), Config::default()).touched_objects();
+    let (st, wk) = (store.clone(), ctx.wakeups.clone());
+    let on_secret = move |o: PartialObjectMeta<Secret>| input_changed(true, &o.metadata, &st, &wk);
+    let (st, wk) = (store.clone(), ctx.wakeups.clone());
+    let on_configmap = move |o: PartialObjectMeta<ConfigMap>| input_changed(false, &o.metadata, &st, &wk);
+    controller
+        .watches_stream(secrets, on_secret)
+        .watches_stream(configmaps, on_configmap)
         .shutdown_on_signal()
-        .run(reconcile, error_policy, state.to_context(client))
+        .run(reconcile, error_policy, ctx)
         .filter_map(|x| async move { std::result::Result::ok(x) })
         .for_each(|_| futures::future::ready(()))
         .await;
+}
+
+/// Map a changed Secret/ConfigMap to the RestEndPoints to wake up
+fn input_changed(
+    is_secret: bool,
+    meta: &kube::api::ObjectMeta,
+    store: &Store<RestEndPoint>,
+    wakeups: &Wakeups,
+) -> Vec<ObjectRef<RestEndPoint>> {
+    if written_by_us(meta) {
+        return Vec::new();
+    }
+    let (ns, name) = (
+        meta.namespace.clone().unwrap_or_default(),
+        meta.name.clone().unwrap_or_default(),
+    );
+    endpoints_using(is_secret, &ns, &name, &store.state())
+        .into_iter()
+        .map(|(rep_ns, rep_name)| {
+            wakeups.insert(&rep_ns, &rep_name);
+            ObjectRef::new(&rep_name).within(&rep_ns)
+        })
+        .collect()
 }
 
 // Mock tests relying on fixtures.rs and its primitive apiserver mocks
@@ -2604,4 +2713,92 @@ mod test {
             assert_eq!(event.action.as_deref(), Some("Hiding"));
         }
     */
+
+    fn rep_with(
+        name: &str,
+        ns: &str,
+        watch: bool,
+        secret: Option<(&str, Option<&str>)>,
+        cm: Option<&str>,
+    ) -> Arc<RestEndPoint> {
+        use super::{ConfigMapRef, InputItem, SecretRef};
+        use kube::Resource;
+        let mut r = RestEndPoint::test();
+        r.meta_mut().name = Some(name.into());
+        r.meta_mut().namespace = Some(ns.into());
+        r.spec.watch_inputs = Some(watch);
+        r.spec.inputs = Some(vec![InputItem {
+            name: "i".into(),
+            secret_ref: secret.map(|(n, ns)| SecretRef {
+                name: n.into(),
+                namespace: ns.map(Into::into),
+                optional: None,
+            }),
+            config_map_ref: cm.map(|n| ConfigMapRef {
+                name: n.into(),
+                namespace: None,
+                optional: None,
+            }),
+            handle_bars_render: None,
+            password_generator: None,
+        }]);
+        Arc::new(r)
+    }
+
+    #[test]
+    fn endpoints_using_maps_inputs_to_endpoints_with_watch_inputs() {
+        use super::endpoints_using;
+        let eps = vec![
+            rep_with("a", "ns1", true, Some(("sec", None)), None),
+            rep_with("b", "ns1", false, Some(("sec", None)), None), // watchInputs off
+            rep_with("c", "ns2", true, Some(("sec", None)), None),  // same name, other namespace
+            rep_with("d", "ns2", true, Some(("sec", Some("ns1"))), None), // cross-namespace ref
+            rep_with("e", "ns1", true, None, Some("sec")),          // a ConfigMap, not a Secret
+        ];
+        let mut got = endpoints_using(true, "ns1", "sec", &eps);
+        got.sort();
+        assert_eq!(got, vec![
+            ("ns1".to_string(), "a".to_string()),
+            ("ns2".to_string(), "d".to_string())
+        ]);
+        assert_eq!(endpoints_using(false, "ns1", "sec", &eps), vec![(
+            "ns1".to_string(),
+            "e".to_string()
+        )]);
+        assert!(endpoints_using(true, "ns1", "other", &eps).is_empty());
+    }
+
+    #[test]
+    fn wakeups_are_consumed_once() {
+        let w = super::Wakeups::default();
+        assert!(!w.take("ns", "a"));
+        w.insert("ns", "a");
+        w.insert("ns", "a");
+        assert!(w.take("ns", "a"));
+        assert!(!w.take("ns", "a"));
+    }
+
+    #[test]
+    fn our_own_writes_do_not_wake_anybody() {
+        use super::{RESTPATH_FINALIZER, written_by_us};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ManagedFieldsEntry, Time};
+        use kube::api::ObjectMeta;
+        let entry = |manager: &str, ts: &str| ManagedFieldsEntry {
+            manager: Some(manager.into()),
+            time: Some(Time(ts.parse().unwrap())),
+            ..Default::default()
+        };
+        let mut meta = ObjectMeta::default();
+        assert!(!written_by_us(&meta), "no managedFields");
+        meta.managed_fields = Some(vec![
+            entry(RESTPATH_FINALIZER, "2026-01-01T00:00:00Z"),
+            entry("kubectl", "2026-01-02T00:00:00Z"),
+        ]);
+        assert!(!written_by_us(&meta), "somebody else wrote last");
+        meta.managed_fields = Some(vec![
+            entry("kubectl", "2026-01-01T00:00:00Z"),
+            entry(RESTPATH_FINALIZER, "2026-01-02T00:00:00Z"),
+        ]);
+        assert!(written_by_us(&meta), "kuberest wrote last");
+    }
 }

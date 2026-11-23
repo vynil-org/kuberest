@@ -335,6 +335,10 @@ spec:
                   type: object
                 nullable: true
                 type: array
+              watchInputs:
+                description: 'watchInputs: reconcile as soon as a Secret or ConfigMap listed in `inputs` changes, instead of waiting for `checkFrequency` (default: false)'
+                nullable: true
+                type: boolean
               writes:
                 description: Sub-paths to the client. Allow to describe the objects to create on the end-point
                 items:
