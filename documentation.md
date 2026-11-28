@@ -52,7 +52,7 @@ Any referenced Secret or ConfigMap missing without that `optional: true` key wil
 
 #### Reacting to a change of an input: `watchInputs`
 
-By default kuberest does *not* watch the Secrets and ConfigMaps used as inputs: a change is reflected on the next verification loop (`checkFrequency`, 1h by default). Set `watchInputs: true` and the RestEndPoint is reconciled as soon as one of its input Secrets or ConfigMaps changes:
+By default kuberest does *not* watch the Secrets and ConfigMaps used as inputs: a change is reflected on the next verification loop (`checkFrequency`, 1h by default). Set `watchInputs: true` and the RestEndPoint is reconciled as soon as one of its input Secrets or ConfigMaps is created, changed or deleted:
 
 ```yaml
 spec:
@@ -66,9 +66,10 @@ spec:
 
 A few things to know:
 - It is opt-in, per RestEndPoint (default: `false`, nothing changes without it). Only the Secrets and ConfigMaps listed in `inputs` are followed, in their own namespace unless a `namespace` is given and cross-namespace access is allowed (see multi-tenancy).
-- The controller watches the *metadata* of the Secrets and ConfigMaps only, never their content. The changes are debounced (2 seconds): a burst of updates gives a single reconcile.
+- The controller watches the *metadata* of the Secrets and ConfigMaps only, never their content. Changes happening while a reconcile is running are grouped into a single next one. Two inputs changed one after the other may give a first reconcile seeing only the first change, followed by a second one.
 - Changes made by kuberest itself (the Secrets and ConfigMaps written by `outputs`) never wake anybody up, otherwise an output used as an input would loop. If a RestEndPoint B uses the output of a RestEndPoint A as an input, B is *not* woken up by A's writes and waits for its `checkFrequency`.
-- On startup, the controller reconciles once every RestEndPoint with `watchInputs`.
+- On startup, the controller reconciles once every RestEndPoint with `watchInputs`, so changes made while it was down are not lost.
+- If a reconcile triggered by an input fails, it is tried again (after 5 minutes at most) without waiting for `checkFrequency`.
 - Rotating tokens (such as a ServiceAccount token Secret) change often: do not use them as `inputs` of a RestEndPoint with `watchInputs`, it would reconcile at each rotation.
 
 Without `watchInputs`, using kuberest as a secret-copier is a bad abuse: the dedicated operators doing this use watch, so the changes are reflected immediately. With it, the [Vault example](#writing-a-kv-v2-secret) (`examples/vault/watch-inputs.yaml`) follows its source Secret the same way.
