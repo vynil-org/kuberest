@@ -1,7 +1,7 @@
 # Copy a Secret into a Vault KV v2 secret and follow it as soon as it changes.
 #
 # `watchInputs: true` makes the controller reconcile this RestEndPoint when a Secret or ConfigMap
-# listed in its `inputs` changes, so `checkFrequency` can become a slow drift check (here 1h)
+# listed in its `inputs` is created, changed or deleted, so `checkFrequency` can become a slow drift check (here 1h)
 # instead of the only way to notice a change.
 # A Secret written by kuberest itself (an `outputs` entry) never wakes anybody up.
 apiVersion: kuberest.solidite.fr/v1
