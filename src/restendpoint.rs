@@ -7,7 +7,7 @@ use crate::{
     writes::{self, AsyncWrite, DiffMode, ItemCtx},
 };
 use chrono::{self, DateTime, Utc};
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, ObjectReference, Secret};
 use kube::{
     CustomResource, Resource,
@@ -27,7 +27,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json_path::JsonPath;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::{
     runtime::Handle,
     sync::RwLock,
@@ -631,10 +634,31 @@ pub struct Context {
 /// A reconcile skips the events that only come from our own status update; a wake-up
 /// must go through that guard, hence this shared map between the watchers and `reconcile`.
 #[derive(Clone, Default)]
-pub struct Wakeups(Arc<std::sync::Mutex<HashMap<(String, String), Instant>>>);
+pub struct Wakeups {
+    marks: Arc<std::sync::Mutex<HashMap<(String, String), Instant>>>,
+    /// The RestEndPoints already reconciled by this process
+    seen: Arc<std::sync::Mutex<HashSet<(String, String)>>>,
+}
 impl Wakeups {
     fn marks(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), Instant>> {
-        self.0.lock().unwrap()
+        self.marks.lock().unwrap()
+    }
+
+    /// Is it the first time this process meets this RestEndPoint ?
+    pub fn first_sight(&self, ns: &str, name: &str) -> bool {
+        self.seen
+            .lock()
+            .unwrap()
+            .insert((ns.to_string(), name.to_string()))
+    }
+
+    /// Drop everything known about a RestEndPoint which is being deleted
+    pub fn remove(&self, ns: &str, name: &str) {
+        self.forget(ns, name);
+        self.seen
+            .lock()
+            .unwrap()
+            .remove(&(ns.to_string(), name.to_string()));
     }
 
     /// Wake a RestEndPoint up now
@@ -876,10 +900,16 @@ impl RestEndPoint {
     async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action> {
         // Before everything : is this reconcillation because of our last status update ?
         let (my_ns, my_name) = (self.namespace().unwrap_or_default(), self.name_any());
-        let woken = ctx.wakeups.take_due(&my_ns, &my_name);
-        if woken {
+        let changed = ctx.wakeups.take_due(&my_ns, &my_name);
+        // Input changes made while the controller was down, or before its store knew this
+        // RestEndPoint, woke nobody up: the first reconcile reads the inputs again
+        let first = self.spec.watch_inputs == Some(true) && ctx.wakeups.first_sight(&my_ns, &my_name);
+        if changed {
             info!("An input changed, reconciling without waiting");
+        } else if first {
+            info!("First reconcile since the controller started, reading the inputs again");
         }
+        let woken = changed || first;
         if let Some(status) = self.status.clone().filter(|_| !woken) {
             // A failed wake-up still to be retried must not be postponed to the next periodic check
             let pending = ctx.wakeups.due_in(&my_ns, &my_name);
@@ -2072,7 +2102,7 @@ impl RestEndPoint {
         let obj_ref = self.object_ref(&());
         let ns = self.namespace().unwrap();
         let name = self.name_any();
-        ctx.wakeups.forget(&ns, &name);
+        ctx.wakeups.remove(&ns, &name);
         let restendpoints: Api<RestEndPoint> = Api::namespaced(client.clone(), &ns);
         let mut conditions: Vec<ApplicationCondition> = Vec::new();
         let mut values = serde_json::json!({"input":{},"pre":{}});
@@ -2642,26 +2672,17 @@ pub async fn run(state: State) {
     let (st, wk) = (store.clone(), ctx.wakeups.clone());
     let on_configmap =
         move |o: PartialObjectMeta<ConfigMap>| input_changed(InputKind::ConfigMap, &o.metadata, &st, &wk);
+    // Events mapped before the store is filled wake nobody up: the first reconcile of each RestEndPoint
+    // covers them. Don't hold these streams on `Store::wait_until_ready()`: in kube-runtime 3.1.0 it only
+    // wakes up its last waiter, and the applier already waits on it.
     controller
-        .watches_stream(once_store_ready(store.clone(), secrets), on_secret)
-        .watches_stream(once_store_ready(store, configmaps), on_configmap)
+        .watches_stream(secrets, on_secret)
+        .watches_stream(configmaps, on_configmap)
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx)
         .filter_map(|x| async move { std::result::Result::ok(x) })
         .for_each(|_| futures::future::ready(()))
         .await;
-}
-
-/// Hold a trigger stream back until the RestEndPoint store is filled: an event mapped against an
-/// empty store would wake nobody up
-fn once_store_ready<S: Stream>(store: Store<RestEndPoint>, stream: S) -> impl Stream<Item = S::Item> {
-    futures::stream::once(async move {
-        if let Err(e) = store.wait_until_ready().await {
-            error!("The RestEndPoint store will never be ready: {e:?}");
-        }
-        stream
-    })
-    .flatten()
 }
 
 /// Map a changed Secret/ConfigMap to the RestEndPoints to wake up
@@ -2905,6 +2926,23 @@ mod test {
     }
 
     #[tokio::test]
+    async fn the_first_reconcile_of_a_watching_endpoint_goes_through_the_status_guard() {
+        let (testctx, fakeserver, _) = Context::test();
+        let mut restendpoint = just_reconciled(3600);
+        restendpoint.spec.watch_inputs = Some(true);
+        let restendpoint = Arc::new(restendpoint);
+        let mocksrv = fakeserver.run(Scenario::StatusPatch((*restendpoint).clone()));
+        reconcile(restendpoint.clone(), testctx.clone())
+            .await
+            .expect("reconciler");
+        timeout_after_1s(mocksrv).await;
+        // only the first one: the mock apiserver is gone, a full reconcile would fail
+        reconcile(restendpoint, testctx.clone()).await.expect("guarded");
+        testctx.wakeups.remove("default", "test");
+        assert!(testctx.wakeups.first_sight("default", "test"));
+    }
+
+    #[tokio::test]
     async fn a_failed_wakeup_is_retried() {
         use kube::runtime::controller::Action;
         let (testctx, fakeserver, _) = Context::test();
@@ -2949,18 +2987,6 @@ mod test {
         }]);
         assert!(input_changed(InputKind::Secret, &meta, &store, &wakeups).is_empty());
         assert!(!wakeups.take_due("ns1", "on"));
-    }
-
-    #[tokio::test]
-    async fn watches_are_held_until_the_store_is_ready() {
-        use futures::{FutureExt, StreamExt};
-        use kube::runtime::{reflector, watcher::Event};
-        let (store, mut writer) = reflector::store::<RestEndPoint>();
-        let mut held = Box::pin(super::once_store_ready(store, futures::stream::iter([1])));
-        assert!(held.next().now_or_never().is_none());
-        writer.apply_watcher_event(&Event::Init);
-        writer.apply_watcher_event(&Event::InitDone);
-        assert_eq!(held.next().await, Some(1));
     }
 
     #[test]
