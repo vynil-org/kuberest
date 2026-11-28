@@ -1,0 +1,19 @@
+# Regression for issue #73: a required input created after the RestEndPoint.
+# retryFrequency is left to its default (300s): only the first-run retry (60s) is that fast.
+apiVersion: kuberest.solidite.fr/v1
+kind: RestEndPoint
+metadata:
+  name: late-input
+spec:
+  inputs:
+  - name: later
+    secretRef:
+      name: late-input
+  client:
+    baseurl: "http://localhost:8080"
+  outputs:
+  - kind: ConfigMap
+    metadata:
+      name: late-input-out
+    data:
+      value: "{{base64_decode input.later.data.value}}"

@@ -45,6 +45,10 @@ pub fn get_client_name() -> String {
 }
 /// Delay before a failed reconcile is tried again
 const ERROR_RETRY: Duration = Duration::from_secs(5 * 60);
+/// Longest delay before the first retry, when the first reconcile could not read its inputs
+const FIRST_RUN_RETRY: u64 = 60;
+/// Pause before a failed teardown is reported: the report itself triggers the next attempt
+const TEARDOWN_BACKOFF: Duration = Duration::from_secs(if cfg!(test) { 0 } else { 30 });
 
 /// ConfigMapRef describe a data input for handlebars renders from a ConfigMap
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug, JsonSchema)]
@@ -628,8 +632,8 @@ pub struct Context {
     pub wakeups: Wakeups,
 }
 
-/// The RestEndPoints (namespace, name) woken up by a watched input, with the instant from which
-/// the wake-up is due.
+/// The RestEndPoints (namespace, name) to wake up, because a watched input changed or because a
+/// first retry is planned, with the instant from which the wake-up is due.
 ///
 /// A reconcile skips the events that only come from our own status update; a wake-up
 /// must go through that guard, hence this shared map between the watchers and `reconcile`.
@@ -905,7 +909,7 @@ impl RestEndPoint {
         // RestEndPoint, woke nobody up: the first reconcile reads the inputs again
         let first = self.spec.watch_inputs == Some(true) && ctx.wakeups.first_sight(&my_ns, &my_name);
         if changed {
-            info!("An input changed, reconciling without waiting");
+            info!("Woken up, reconciling without waiting");
         } else if first {
             info!("First reconcile since the controller started, reading the inputs again");
         }
@@ -1059,11 +1063,10 @@ impl RestEndPoint {
                                     "Required secret '{}' not found for Input '{}': {}",
                                     secret.name, input.name, e
                                 );
-                                return Err(Error::MethodFailed(
-                                    "ReadSecret".to_string(),
-                                    404,
-                                    format!("Secret '{}' not found for Input '{}'", secret.name, input.name),
-                                ));
+                                conditions.push(ApplicationCondition::input_failed(&format!(
+                                    "Input '{}' Secret {}.{} not found",
+                                    input.name, my_ns, secret.name
+                                )));
                             }
                         }
                     }
@@ -1128,14 +1131,10 @@ impl RestEndPoint {
                                     "Required configmap '{}' not found for Input '{}': {}",
                                     cfgmap.name, input.name, e
                                 );
-                                return Err(Error::MethodFailed(
-                                    "ReadConfigMap".to_string(),
-                                    404,
-                                    format!(
-                                        "ConfigMap '{}' not found for Input '{}'",
-                                        cfgmap.name, input.name
-                                    ),
-                                ));
+                                conditions.push(ApplicationCondition::input_failed(&format!(
+                                    "Input '{}' ConfigMap {}.{} not found",
+                                    input.name, my_ns, cfgmap.name
+                                )));
                             }
                         }
                     }
@@ -1214,7 +1213,14 @@ impl RestEndPoint {
                 .map_err(Error::KubeError)?;
             // Some missing Secret or ConfigMap might be ok on first run, dont wait too much
             if first_run {
-                return Ok(Action::requeue(Duration::from_secs(60)));
+                let delay = Duration::from_secs(
+                    self.spec
+                        .retry_frequency
+                        .map_or(FIRST_RUN_RETRY, |r| r.min(FIRST_RUN_RETRY)),
+                );
+                // Without a wake-up, the guard of reconcile() postpones this retry to retryFrequency
+                ctx.wakeups.retry_after(&ns, &name, delay);
+                return Ok(Action::requeue(delay));
             } else {
                 return Ok(Action::requeue(Duration::from_secs(
                     self.spec.retry_frequency.unwrap_or(5 * 60),
@@ -2205,14 +2211,10 @@ impl RestEndPoint {
                                         "Required secret '{}' not found for Input '{}': {}",
                                         secret.name, input.name, e
                                     );
-                                    return Err(Error::MethodFailed(
-                                        "ReadSecret".to_string(),
-                                        404,
-                                        format!(
-                                            "Secret '{}' not found for Input '{}'",
-                                            secret.name, input.name
-                                        ),
-                                    ));
+                                    conditions.push(ApplicationCondition::input_failed(&format!(
+                                        "Input '{}' Secret {}.{} not found",
+                                        input.name, my_ns, secret.name
+                                    )));
                                 }
                             }
                         }
@@ -2277,14 +2279,10 @@ impl RestEndPoint {
                                         "Required configmap '{}' not found for Input '{}': {}",
                                         cfgmap.name, input.name, e
                                     );
-                                    return Err(Error::MethodFailed(
-                                        "ReadConfigMap".to_string(),
-                                        404,
-                                        format!(
-                                            "ConfigMap '{}' not found for Input '{}'",
-                                            cfgmap.name, input.name
-                                        ),
-                                    ));
+                                    conditions.push(ApplicationCondition::input_failed(&format!(
+                                        "Input '{}' ConfigMap {}.{} not found",
+                                        input.name, my_ns, cfgmap.name
+                                    )));
                                 }
                             }
                         }
@@ -2359,6 +2357,7 @@ impl RestEndPoint {
                         String::from("fail"),
                     )
                     .await?;
+                    tokio::time::sleep(TEARDOWN_BACKOFF).await;
                     conditions.push(ApplicationCondition::not_ready(msg));
                     let new_status = Patch::Apply(json!({
                         "apiVersion": "kuberest.solidite.fr/v1",
@@ -2370,9 +2369,8 @@ impl RestEndPoint {
                         .patch_status(&name, &ps, &new_status)
                         .await
                         .map_err(Error::KubeError)?;
-                    return Ok(Action::requeue(Duration::from_secs(
-                        self.spec.retry_frequency.unwrap_or(5 * 60),
-                    )));
+                    // An Ok would remove the finalizer and orphan what is still to delete
+                    return Err(Error::TeardownIncomplete);
                 }
             }
             rhai.set_dynamic("init", &values["init"]);
@@ -2380,15 +2378,17 @@ impl RestEndPoint {
         }
 
         // Setup the httpClient
-        let mut rest = RestClient::new(&template!(
-            self.spec.client.baseurl.clone().as_str(),
-            hbs,
-            &values,
-            conditions,
-            recorder,
-            &obj_ref
-        ));
+        // The base url may need the inputs, which are only read when there is something to call
+        let mut rest = RestClient::new("");
         if do_prepare_client {
+            rest = RestClient::new(&template!(
+                self.spec.client.baseurl.clone().as_str(),
+                hbs,
+                &values,
+                conditions,
+                recorder,
+                &obj_ref
+            ));
             if let Some(headers) = self.spec.client.headers.clone() {
                 for (key, value) in headers {
                     rest.add_header(
@@ -2456,6 +2456,7 @@ impl RestEndPoint {
                     String::from("fail"),
                 )
                 .await?;
+                tokio::time::sleep(TEARDOWN_BACKOFF).await;
                 conditions.push(ApplicationCondition::not_ready(msg));
                 let new_status = Patch::Apply(json!({
                     "apiVersion": "kuberest.solidite.fr/v1",
@@ -2467,9 +2468,8 @@ impl RestEndPoint {
                     .patch_status(&name, &ps, &new_status)
                     .await
                     .map_err(Error::KubeError)?;
-                return Ok(Action::requeue(Duration::from_secs(
-                    self.spec.retry_frequency.unwrap_or(5 * 60),
-                )));
+                // An Ok would remove the finalizer and orphan what is still to delete
+                return Err(Error::TeardownIncomplete);
             }
         }
 
@@ -2572,12 +2572,8 @@ impl RestEndPoint {
                 String::from("fail"),
             )
             .await?;
-            // Wait 30s before reporting the failure, because the controller keeps trying and it might hammer the api-server and the api-endpoint targeted otherwise. Beside the events generated already informed the user of the issue
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                })
-            });
+            // Wait before reporting the failure, because the controller keeps trying and it might hammer the api-server and the api-endpoint targeted otherwise. Beside the events generated already informed the user of the issue
+            tokio::time::sleep(TEARDOWN_BACKOFF).await;
             conditions.push(ApplicationCondition::not_ready(msg));
             let new_status = Patch::Apply(json!({
                 "apiVersion": "kuberest.solidite.fr/v1",
@@ -2712,9 +2708,15 @@ fn input_changed(
 // Mock tests relying on fixtures.rs and its primitive apiserver mocks
 #[cfg(test)]
 mod test {
-    use super::{Context, RestEndPoint, /* error_policy, */ reconcile};
+    use super::{
+        ApplicationCondition, ConditionsStatus, ConditionsType, Context, OwnedRestPoint, RestEndPoint,
+        RestEndPointStatus, /* error_policy, */ reconcile,
+    };
     use crate::fixtures::{Scenario, timeout_after_1s};
+    use kube::runtime::controller::Action;
+    use serde_json::json;
     use std::sync::Arc;
+    use tokio::time::Duration;
 
     #[tokio::test]
     async fn restendpoint_without_finalizer_gets_a_finalizer() {
@@ -2725,6 +2727,206 @@ mod test {
             .await
             .expect("reconciler");
         timeout_after_1s(mocksrv).await;
+    }
+
+    type Calls = Arc<std::sync::Mutex<Vec<(http::Method, String, serde_json::Value)>>>;
+
+    /// An apiserver without any Secret nor ConfigMap, which records the calls it receives
+    fn apiserver_without_inputs(rep: RestEndPoint) -> (Arc<Context>, Calls) {
+        use http::{Request, Response};
+        use kube::client::Body;
+        let (service, mut handle) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
+        let calls = Calls::default();
+        let record = calls.clone();
+        tokio::spawn(async move {
+            while let Some((request, send)) = handle.next_request().await {
+                let (method, path) = (request.method().clone(), request.uri().path().to_string());
+                let bytes = request.into_body().collect_bytes().await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                record.lock().unwrap().push((method, path.clone(), body.clone()));
+                let (code, answer) = if path.contains("/secrets/") || path.contains("/configmaps/") {
+                    (
+                        404,
+                        json!({"kind":"Status","apiVersion":"v1","status":"Failure","message":"not found","reason":"NotFound","code":404}),
+                    )
+                } else if path.contains("/events") {
+                    (200, body)
+                } else if path.starts_with("/apis/kuberest.solidite.fr/") {
+                    (200, serde_json::to_value(&rep).unwrap())
+                } else {
+                    (
+                        200,
+                        json!({"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadata","metadata":{"name":"default"}}),
+                    )
+                };
+                let answer = Body::from(serde_json::to_vec(&answer).unwrap());
+                send.send_response(Response::builder().status(code).body(answer).unwrap());
+            }
+        });
+        let ctx = Context {
+            client: kube::Client::new(service, "default"),
+            metrics: Default::default(),
+            diagnostics: Arc::default(),
+            wakeups: Default::default(),
+        };
+        (Arc::new(ctx), calls)
+    }
+
+    /// The status sent by the last status patch
+    fn patched_status(calls: &Calls) -> RestEndPointStatus {
+        let calls = calls.lock().unwrap();
+        let (_, _, body) = calls
+            .iter()
+            .rfind(|(_, path, _)| path.ends_with("/status"))
+            .expect("a status patch");
+        serde_json::from_value(body["status"].clone()).expect("valid status")
+    }
+
+    fn finalizer_was_removed(calls: &Calls) -> bool {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, path, _)| *method == http::Method::PATCH && path.ends_with("/restendpoints/test"))
+    }
+
+    fn assert_input_failed(status: &RestEndPointStatus, message: &str) {
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.condition_type == ConditionsType::InputFailed && c.message == message),
+            "{:?}",
+            status.conditions
+        );
+        assert!(
+            status.conditions.iter().any(|c| {
+                c.condition_type == ConditionsType::Ready && c.status == ConditionsStatus::False
+            })
+        );
+    }
+
+    /// A finalized RestEndPoint with a required input which does not exist
+    fn rep_missing(secret: bool, retry_frequency: Option<u64>) -> RestEndPoint {
+        let mut rep = (*rep_with(
+            "test",
+            "default",
+            false,
+            secret.then_some(("later", None)),
+            (!secret).then_some("later"),
+        ))
+        .clone()
+        .finalized();
+        rep.spec.retry_frequency = retry_frequency;
+        rep
+    }
+
+    fn an_owned_write() -> OwnedRestPoint {
+        OwnedRestPoint::new("things", "k1", "group", "item", true, false, "id")
+    }
+
+    fn status_with(owned_target: Vec<OwnedRestPoint>) -> RestEndPointStatus {
+        RestEndPointStatus {
+            conditions: vec![ApplicationCondition::is_ready("done")],
+            generation: 1,
+            owned: Vec::new(),
+            owned_target,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_secret_is_reported_and_retried_after_one_minute() {
+        let rep = rep_missing(true, None);
+        let (ctx, calls) = apiserver_without_inputs(rep.clone());
+        let action = reconcile(Arc::new(rep.clone()), ctx.clone())
+            .await
+            .expect("reported");
+        assert_eq!(action, Action::requeue(Duration::from_secs(60)));
+        let status = patched_status(&calls);
+        assert_input_failed(&status, "Input 'i' Secret default.later not found");
+        // the reconcile triggered by our own status patch must not postpone this first retry
+        let action = reconcile(Arc::new(rep.with_status(status)), ctx.clone())
+            .await
+            .expect("guarded");
+        let wait = ctx.wakeups.due_in("default", "test").expect("a wake-up");
+        assert!(wait <= Duration::from_secs(60), "{wait:?}");
+        assert_ne!(action, Action::requeue(Duration::from_secs(300)));
+    }
+
+    #[tokio::test]
+    async fn a_short_retry_frequency_also_applies_to_the_first_retry() {
+        let rep = rep_missing(true, Some(30));
+        let (ctx, _) = apiserver_without_inputs(rep.clone());
+        let action = reconcile(Arc::new(rep), ctx).await.expect("reported");
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+    }
+
+    #[tokio::test]
+    async fn a_missing_configmap_replaces_a_stale_ready_status() {
+        let mut rep = rep_missing(false, Some(120)).with_status(status_with(vec![an_owned_write()]));
+        rep.metadata.generation = Some(2);
+        let (ctx, calls) = apiserver_without_inputs(rep.clone());
+        let action = reconcile(Arc::new(rep), ctx.clone()).await.expect("reported");
+        assert_eq!(action, Action::requeue(Duration::from_secs(120)));
+        let status = patched_status(&calls);
+        assert_input_failed(&status, "Input 'i' ConfigMap default.later not found");
+        assert_eq!(status.owned_target, vec![an_owned_write()]);
+        assert!(ctx.wakeups.due_in("default", "test").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn teardown_goes_on_with_a_missing_input_and_reports_it() {
+        let mut rep = rep_missing(true, None)
+            .with_status(status_with(vec![an_owned_write()]))
+            .needs_delete();
+        rep.spec.client.baseurl = "http://127.0.0.1:1".into();
+        // the test default is `true`, which ignores the delete failures
+        rep.spec.client.teardown = None;
+        let (ctx, calls) = apiserver_without_inputs(rep.clone());
+        // required before any REST call (done by main in the controller)
+        vynil_core::set_client_name(super::get_client_name);
+        assert!(reconcile(Arc::new(rep), ctx).await.is_err());
+        let status = patched_status(&calls);
+        assert_input_failed(&status, "Input 'i' Secret default.later not found");
+        // the delete was attempted and failed: the object is still ours
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.condition_type == ConditionsType::WriteDeleteFailed)
+        );
+        assert_eq!(status.owned_target, vec![an_owned_write()]);
+        assert!(!finalizer_was_removed(&calls));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_init_or_teardown_script_keeps_the_finalizer() {
+        for init in [true, false] {
+            let mut rep = rep_missing(true, None)
+                .with_status(status_with(vec![an_owned_write()]))
+                .needs_delete();
+            if init {
+                rep.spec.init = Some("#{}".into());
+            } else {
+                rep.spec.teardown = Some("#{}".into());
+            }
+            let (ctx, calls) = apiserver_without_inputs(rep.clone());
+            assert!(reconcile(Arc::new(rep), ctx).await.is_err(), "init: {init}");
+            assert_eq!(patched_status(&calls).owned_target, vec![an_owned_write()]);
+            assert!(!finalizer_was_removed(&calls), "init: {init}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn teardown_ends_once_nothing_is_left_to_delete() {
+        // the second pass after `teardown_goes_on_...` : the inputs are not read anymore
+        let mut rep = rep_missing(true, None)
+            .with_status(status_with(Vec::new()))
+            .needs_delete();
+        rep.spec.client.baseurl = "http://{{base64_decode input.i.data.host}}".into();
+        let (ctx, calls) = apiserver_without_inputs(rep.clone());
+        reconcile(Arc::new(rep), ctx).await.expect("released");
+        assert!(finalizer_was_removed(&calls));
     }
 
     #[tokio::test]
@@ -2883,7 +3085,6 @@ mod test {
 
     #[test]
     fn a_retried_wakeup_waits_for_its_delay() {
-        use tokio::time::Duration;
         let w = super::Wakeups::default();
         w.retry_after("ns", "a", Duration::from_secs(300));
         assert!(!w.take_due("ns", "a"), "not due yet");
@@ -2902,7 +3103,6 @@ mod test {
 
     /// A finalized RestEndPoint which was successfully reconciled just now
     fn just_reconciled(check_frequency: u64) -> RestEndPoint {
-        use super::{ApplicationCondition, RestEndPointStatus};
         let mut rep = RestEndPoint::test().finalized();
         rep.spec.check_frequency = Some(check_frequency);
         rep.with_status(RestEndPointStatus {
@@ -2944,7 +3144,6 @@ mod test {
 
     #[tokio::test]
     async fn a_failed_wakeup_is_retried() {
-        use kube::runtime::controller::Action;
         let (testctx, fakeserver, _) = Context::test();
         drop(fakeserver); // every call to the apiserver fails
         let restendpoint = Arc::new(just_reconciled(0));
