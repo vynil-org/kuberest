@@ -8,24 +8,34 @@ use crate::{
 };
 use chrono::{self, DateTime, Utc};
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Namespace, ObjectReference};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, ObjectReference, Secret};
 use kube::{
     CustomResource, Resource,
     api::{Api, ListParams, Patch, PatchParams, ResourceExt},
     client::Client,
+    core::PartialObjectMeta,
     runtime::{
+        WatchStreamExt,
         controller::{Action, Controller},
         events::{Event, EventType, Recorder, Reporter},
         finalizer::{Event as Finalizer, finalizer},
-        watcher::Config,
+        reflector::{ObjectRef, Store},
+        watcher::{Config, metadata_watcher},
     },
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json_path::JsonPath;
-use std::{collections::HashMap, sync::Arc};
-use tokio::{runtime::Handle, sync::RwLock, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+use tokio::{
+    runtime::Handle,
+    sync::RwLock,
+    time::{Duration, Instant},
+};
 use tracing::*;
 use vynil_core::http::{CreateMethod, DeleteMethod, ReadMethod, RestClient, UpdateMethod};
 
@@ -33,6 +43,8 @@ pub static RESTPATH_FINALIZER: &str = "restendpoints.kuberest.solidite.fr";
 pub fn get_client_name() -> String {
     RESTPATH_FINALIZER.to_string()
 }
+/// Delay before a failed reconcile is tried again
+const ERROR_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// ConfigMapRef describe a data input for handlebars renders from a ConfigMap
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug, JsonSchema)]
@@ -588,6 +600,8 @@ pub struct RestEndPointSpec {
     pub check_frequency: Option<u64>,
     /// retryFrequency define the pooling interval if previous try have failed (in seconds, default: 300 aka 5mn)
     pub retry_frequency: Option<u64>,
+    /// watchInputs: reconcile as soon as a Secret or ConfigMap listed in `inputs` is created, changed or deleted, instead of waiting for `checkFrequency`. Writes made by kuberest itself (outputs) wake nobody up (default: false)
+    pub watch_inputs: Option<bool>,
     /// A rhai teardown-script for a final cleanup on RestEndPoint deletion
     pub teardown: Option<String>,
 }
@@ -610,6 +624,130 @@ pub struct Context {
     pub diagnostics: Arc<RwLock<Diagnostics>>,
     /// Prometheus metrics
     pub metrics: Metrics,
+    /// RestEndPoints woken up by a change of one of their inputs
+    pub wakeups: Wakeups,
+}
+
+/// The RestEndPoints (namespace, name) woken up by a watched input, with the instant from which
+/// the wake-up is due.
+///
+/// A reconcile skips the events that only come from our own status update; a wake-up
+/// must go through that guard, hence this shared map between the watchers and `reconcile`.
+#[derive(Clone, Default)]
+pub struct Wakeups {
+    marks: Arc<std::sync::Mutex<HashMap<(String, String), Instant>>>,
+    /// The RestEndPoints already reconciled by this process
+    seen: Arc<std::sync::Mutex<HashSet<(String, String)>>>,
+}
+impl Wakeups {
+    fn marks(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), Instant>> {
+        self.marks.lock().unwrap()
+    }
+
+    /// Is it the first time this process meets this RestEndPoint ?
+    pub fn first_sight(&self, ns: &str, name: &str) -> bool {
+        self.seen
+            .lock()
+            .unwrap()
+            .insert((ns.to_string(), name.to_string()))
+    }
+
+    /// Drop everything known about a RestEndPoint which is being deleted
+    pub fn remove(&self, ns: &str, name: &str) {
+        self.forget(ns, name);
+        self.seen
+            .lock()
+            .unwrap()
+            .remove(&(ns.to_string(), name.to_string()));
+    }
+
+    /// Wake a RestEndPoint up now
+    pub fn insert(&self, ns: &str, name: &str) {
+        self.marks()
+            .insert((ns.to_string(), name.to_string()), Instant::now());
+    }
+
+    /// Wake a RestEndPoint up again after `delay`, unless a wake-up is already recorded
+    pub fn retry_after(&self, ns: &str, name: &str, delay: Duration) {
+        self.marks()
+            .entry((ns.to_string(), name.to_string()))
+            .or_insert_with(|| Instant::now() + delay);
+    }
+
+    /// Is there a due wake-up for this RestEndPoint ? (clears it)
+    pub fn take_due(&self, ns: &str, name: &str) -> bool {
+        let key = (ns.to_string(), name.to_string());
+        let mut marks = self.marks();
+        let due = marks.get(&key).is_some_and(|at| *at <= Instant::now());
+        if due {
+            marks.remove(&key);
+        }
+        due
+    }
+
+    /// Time left before the recorded wake-up of this RestEndPoint is due, if there is one
+    pub fn due_in(&self, ns: &str, name: &str) -> Option<Duration> {
+        self.marks()
+            .get(&(ns.to_string(), name.to_string()))
+            .map(|at| at.saturating_duration_since(Instant::now()))
+    }
+
+    /// Drop the wake-up of this RestEndPoint, due or not. Was there one ?
+    pub fn forget(&self, ns: &str, name: &str) -> bool {
+        self.marks().remove(&(ns.to_string(), name.to_string())).is_some()
+    }
+}
+
+/// The kind of object an input can be read from, and watched
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputKind {
+    Secret,
+    ConfigMap,
+}
+
+/// The (namespace, name) of the RestEndPoints with `watchInputs` that list the given Secret or ConfigMap in their inputs
+pub fn endpoints_using(
+    kind: InputKind,
+    ns: &str,
+    name: &str,
+    endpoints: &[Arc<RestEndPoint>],
+) -> Vec<(String, String)> {
+    endpoints
+        .iter()
+        .filter(|rep| rep.spec.watch_inputs.unwrap_or(false))
+        .filter(|rep| {
+            let rep_ns = rep.namespace().unwrap_or_default();
+            rep.spec.inputs.iter().flatten().any(|i| match kind {
+                InputKind::Secret => i
+                    .secret_ref
+                    .as_ref()
+                    .is_some_and(|r| r.name == name && r.namespace.as_deref().unwrap_or(&rep_ns) == ns),
+                InputKind::ConfigMap => i
+                    .config_map_ref
+                    .as_ref()
+                    .is_some_and(|r| r.name == name && r.namespace.as_deref().unwrap_or(&rep_ns) == ns),
+            })
+        })
+        .map(|rep| (rep.namespace().unwrap_or_default(), rep.name_any()))
+        .collect()
+}
+
+/// Was the last write on this object made by kuberest itself (an output) ?
+/// Such an event must not wake anybody up, otherwise an output used as an input would loop.
+///
+/// `managedFields[].time` has a one second granularity: when somebody else wrote during the same
+/// second, we can't tell who was last, so the event is kept.
+pub fn written_by_us(meta: &kube::api::ObjectMeta) -> bool {
+    let newest = |ours: bool| {
+        meta.managed_fields
+            .iter()
+            .flatten()
+            .filter(|f| (f.manager.as_deref() == Some(RESTPATH_FINALIZER)) == ours)
+            .map(|f| f.time.clone())
+            .max()
+    };
+    // `None` (no write at all) is lower than any write
+    newest(true) > newest(false)
 }
 
 #[instrument(skip(ctx, rest_path), fields(trace_id))]
@@ -635,7 +773,7 @@ async fn reconcile(rest_path: Arc<RestEndPoint>, ctx: Arc<Context>) -> Result<Ac
 fn error_policy(restendpoint: Arc<RestEndPoint>, error: &Error, ctx: Arc<Context>) -> Action {
     warn!("reconcile failed: {:?}", error);
     ctx.metrics.reconcile_failure(&restendpoint, error);
-    Action::requeue(Duration::from_secs(5 * 60))
+    Action::requeue(ERROR_RETRY)
 }
 
 impl RestEndPoint {
@@ -761,7 +899,24 @@ impl RestEndPoint {
     // Reconcile (for non-finalizer related changes)
     async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action> {
         // Before everything : is this reconcillation because of our last status update ?
-        if let Some(status) = self.status.clone() {
+        let (my_ns, my_name) = (self.namespace().unwrap_or_default(), self.name_any());
+        let changed = ctx.wakeups.take_due(&my_ns, &my_name);
+        // Input changes made while the controller was down, or before its store knew this
+        // RestEndPoint, woke nobody up: the first reconcile reads the inputs again
+        let first = self.spec.watch_inputs == Some(true) && ctx.wakeups.first_sight(&my_ns, &my_name);
+        if changed {
+            info!("An input changed, reconciling without waiting");
+        } else if first {
+            info!("First reconcile since the controller started, reading the inputs again");
+        }
+        let woken = changed || first;
+        if let Some(status) = self.status.clone().filter(|_| !woken) {
+            // A failed wake-up still to be retried must not be postponed to the next periodic check
+            let pending = ctx.wakeups.due_in(&my_ns, &my_name);
+            let wait = |secs: u64| {
+                let delay = Duration::from_secs(secs);
+                Action::requeue(pending.map_or(delay, |p| delay.min(p)))
+            };
             let now = chrono::offset::Utc::now();
             if status.generation == self.metadata.generation.unwrap_or(1) {
                 let delta: u64 = (now - status.conditions[0].last_transition_time.unwrap_or(now))
@@ -779,7 +934,7 @@ impl RestEndPoint {
                             "The spec didnt change, only the status (which this code just did), waiting {} more secs",
                             next - delta
                         );
-                        return Ok(Action::requeue(Duration::from_secs(next - delta)));
+                        return Ok(wait(next - delta));
                     }
                 } else {
                     let next = self.spec.check_frequency.unwrap_or(60 * 60);
@@ -789,16 +944,29 @@ impl RestEndPoint {
                                 "The spec didnt change, only the status (which this code just did), waiting {} more secs",
                                 next - delta
                             );
-                            return Ok(Action::requeue(Duration::from_secs(next - delta)));
+                            return Ok(wait(next - delta));
                         }
                     } else {
                         warn!("No spec change, should have awaited change. Will do.");
-                        return Ok(Action::await_change());
+                        return Ok(pending.map_or_else(Action::await_change, Action::requeue));
                     }
                 }
             }
         }
 
+        // This full reconcile also serves a wake-up which was waiting for its retry
+        let woken = ctx.wakeups.forget(&my_ns, &my_name) || woken;
+        let result = self.apply_spec(ctx.clone()).await;
+        // A failed reconcile may not have recorded anything in the status: keep the wake-up,
+        // otherwise the guard above would skip the retry until `checkFrequency`
+        if woken && result.is_err() {
+            ctx.wakeups.retry_after(&my_ns, &my_name, ERROR_RETRY);
+        }
+        result
+    }
+
+    // Read the inputs, call the REST endpoint and write the outputs
+    async fn apply_spec(&self, ctx: Arc<Context>) -> Result<Action> {
         let client = ctx.client.clone();
         let recorder = ctx.diagnostics.read().await.recorder(client.clone());
         let obj_ref = self.object_ref(&());
@@ -1934,6 +2102,7 @@ impl RestEndPoint {
         let obj_ref = self.object_ref(&());
         let ns = self.namespace().unwrap();
         let name = self.name_any();
+        ctx.wakeups.remove(&ns, &name);
         let restendpoints: Api<RestEndPoint> = Api::namespaced(client.clone(), &ns);
         let mut conditions: Vec<ApplicationCondition> = Vec::new();
         let mut values = serde_json::json!({"input":{},"pre":{}});
@@ -2476,6 +2645,7 @@ impl State {
             client,
             metrics: Metrics::default().register(&self.registry).unwrap(),
             diagnostics: self.diagnostics.clone(),
+            wakeups: Wakeups::default(),
         })
     }
 }
@@ -2489,12 +2659,54 @@ pub async fn run(state: State) {
         info!("Installation: cargo run --bin crdgen | kubectl apply -f -");
         std::process::exit(1);
     }
-    Controller::new(restendpoints, Config::default().any_semantic())
+    let ctx = state.to_context(client.clone());
+    let controller = Controller::new(restendpoints, Config::default().any_semantic());
+    let store = controller.store();
+    // Metadata-only watches: the content of the Secrets never enters the memory of the watcher
+    let secrets = metadata_watcher(Api::<Secret>::all(client.clone()), Config::default()).touched_objects();
+    let configmaps =
+        metadata_watcher(Api::<ConfigMap>::all(client.clone()), Config::default()).touched_objects();
+    let (st, wk) = (store.clone(), ctx.wakeups.clone());
+    let on_secret =
+        move |o: PartialObjectMeta<Secret>| input_changed(InputKind::Secret, &o.metadata, &st, &wk);
+    let (st, wk) = (store.clone(), ctx.wakeups.clone());
+    let on_configmap =
+        move |o: PartialObjectMeta<ConfigMap>| input_changed(InputKind::ConfigMap, &o.metadata, &st, &wk);
+    // Events mapped before the store is filled wake nobody up: the first reconcile of each RestEndPoint
+    // covers them. Don't hold these streams on `Store::wait_until_ready()`: in kube-runtime 3.1.0 it only
+    // wakes up its last waiter, and the applier already waits on it.
+    controller
+        .watches_stream(secrets, on_secret)
+        .watches_stream(configmaps, on_configmap)
         .shutdown_on_signal()
-        .run(reconcile, error_policy, state.to_context(client))
+        .run(reconcile, error_policy, ctx)
         .filter_map(|x| async move { std::result::Result::ok(x) })
         .for_each(|_| futures::future::ready(()))
         .await;
+}
+
+/// Map a changed Secret/ConfigMap to the RestEndPoints to wake up
+fn input_changed(
+    kind: InputKind,
+    meta: &kube::api::ObjectMeta,
+    store: &Store<RestEndPoint>,
+    wakeups: &Wakeups,
+) -> Vec<ObjectRef<RestEndPoint>> {
+    // Every Secret and ConfigMap of the cluster goes through here: don't copy the store for nothing
+    if store.find(|r| r.spec.watch_inputs == Some(true)).is_none() || written_by_us(meta) {
+        return Vec::new();
+    }
+    let (ns, name) = (
+        meta.namespace.clone().unwrap_or_default(),
+        meta.name.clone().unwrap_or_default(),
+    );
+    endpoints_using(kind, &ns, &name, &store.state())
+        .into_iter()
+        .map(|(rep_ns, rep_name)| {
+            wakeups.insert(&rep_ns, &rep_name);
+            ObjectRef::new(&rep_name).within(&rep_ns)
+        })
+        .collect()
 }
 
 // Mock tests relying on fixtures.rs and its primitive apiserver mocks
@@ -2604,4 +2816,206 @@ mod test {
             assert_eq!(event.action.as_deref(), Some("Hiding"));
         }
     */
+
+    fn rep_with(
+        name: &str,
+        ns: &str,
+        watch: bool,
+        secret: Option<(&str, Option<&str>)>,
+        cm: Option<&str>,
+    ) -> Arc<RestEndPoint> {
+        use super::{ConfigMapRef, InputItem, SecretRef};
+        use kube::Resource;
+        let mut r = RestEndPoint::test();
+        r.meta_mut().name = Some(name.into());
+        r.meta_mut().namespace = Some(ns.into());
+        r.spec.watch_inputs = Some(watch);
+        r.spec.inputs = Some(vec![InputItem {
+            name: "i".into(),
+            secret_ref: secret.map(|(n, ns)| SecretRef {
+                name: n.into(),
+                namespace: ns.map(Into::into),
+                optional: None,
+            }),
+            config_map_ref: cm.map(|n| ConfigMapRef {
+                name: n.into(),
+                namespace: None,
+                optional: None,
+            }),
+            handle_bars_render: None,
+            password_generator: None,
+        }]);
+        Arc::new(r)
+    }
+
+    #[test]
+    fn endpoints_using_maps_inputs_to_endpoints_with_watch_inputs() {
+        use super::{InputKind, endpoints_using};
+        let eps = vec![
+            rep_with("a", "ns1", true, Some(("sec", None)), None),
+            rep_with("b", "ns1", false, Some(("sec", None)), None), // watchInputs off
+            rep_with("c", "ns2", true, Some(("sec", None)), None),  // same name, other namespace
+            rep_with("d", "ns2", true, Some(("sec", Some("ns1"))), None), // cross-namespace ref
+            rep_with("e", "ns1", true, None, Some("sec")),          // a ConfigMap, not a Secret
+        ];
+        let mut got = endpoints_using(InputKind::Secret, "ns1", "sec", &eps);
+        got.sort();
+        assert_eq!(got, vec![
+            ("ns1".to_string(), "a".to_string()),
+            ("ns2".to_string(), "d".to_string())
+        ]);
+        assert_eq!(endpoints_using(InputKind::ConfigMap, "ns1", "sec", &eps), vec![(
+            "ns1".to_string(),
+            "e".to_string()
+        )]);
+        assert!(endpoints_using(InputKind::Secret, "ns1", "other", &eps).is_empty());
+    }
+
+    #[test]
+    fn wakeups_are_consumed_once() {
+        let w = super::Wakeups::default();
+        assert!(!w.take_due("ns", "a"));
+        w.insert("ns", "a");
+        w.insert("ns", "a");
+        assert!(w.take_due("ns", "a"));
+        assert!(!w.take_due("ns", "a"));
+    }
+
+    #[test]
+    fn a_retried_wakeup_waits_for_its_delay() {
+        use tokio::time::Duration;
+        let w = super::Wakeups::default();
+        w.retry_after("ns", "a", Duration::from_secs(300));
+        assert!(!w.take_due("ns", "a"), "not due yet");
+        assert!(w.due_in("ns", "a").is_some_and(|d| d > Duration::from_secs(200)));
+        // a new change of an input does not wait for the retry
+        w.insert("ns", "a");
+        assert!(w.take_due("ns", "a"));
+        // and a retry does not delay a change which is already recorded
+        w.insert("ns", "a");
+        w.retry_after("ns", "a", Duration::from_secs(300));
+        assert!(w.take_due("ns", "a"));
+        w.retry_after("ns", "a", Duration::from_secs(300));
+        assert!(w.forget("ns", "a"));
+        assert!(w.due_in("ns", "a").is_none());
+    }
+
+    /// A finalized RestEndPoint which was successfully reconciled just now
+    fn just_reconciled(check_frequency: u64) -> RestEndPoint {
+        use super::{ApplicationCondition, RestEndPointStatus};
+        let mut rep = RestEndPoint::test().finalized();
+        rep.spec.check_frequency = Some(check_frequency);
+        rep.with_status(RestEndPointStatus {
+            conditions: vec![ApplicationCondition::is_ready("done")],
+            generation: 1,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_wakeup_goes_through_the_status_guard() {
+        let (testctx, fakeserver, _) = Context::test();
+        let restendpoint = just_reconciled(3600);
+        testctx.wakeups.insert("default", "test");
+        let mocksrv = fakeserver.run(Scenario::StatusPatch(restendpoint.clone()));
+        reconcile(Arc::new(restendpoint), testctx.clone())
+            .await
+            .expect("reconciler");
+        timeout_after_1s(mocksrv).await;
+        assert!(testctx.wakeups.due_in("default", "test").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_first_reconcile_of_a_watching_endpoint_goes_through_the_status_guard() {
+        let (testctx, fakeserver, _) = Context::test();
+        let mut restendpoint = just_reconciled(3600);
+        restendpoint.spec.watch_inputs = Some(true);
+        let restendpoint = Arc::new(restendpoint);
+        let mocksrv = fakeserver.run(Scenario::StatusPatch((*restendpoint).clone()));
+        reconcile(restendpoint.clone(), testctx.clone())
+            .await
+            .expect("reconciler");
+        timeout_after_1s(mocksrv).await;
+        // only the first one: the mock apiserver is gone, a full reconcile would fail
+        reconcile(restendpoint, testctx.clone()).await.expect("guarded");
+        testctx.wakeups.remove("default", "test");
+        assert!(testctx.wakeups.first_sight("default", "test"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_wakeup_is_retried() {
+        use kube::runtime::controller::Action;
+        let (testctx, fakeserver, _) = Context::test();
+        drop(fakeserver); // every call to the apiserver fails
+        let restendpoint = Arc::new(just_reconciled(0));
+        testctx.wakeups.insert("default", "test");
+        assert!(reconcile(restendpoint.clone(), testctx.clone()).await.is_err());
+        assert!(testctx.wakeups.due_in("default", "test").is_some());
+        // an event coming before the retry is due must not forget about it
+        let action = reconcile(restendpoint, testctx.clone()).await.expect("guarded");
+        assert_ne!(action, Action::await_change());
+        assert!(testctx.wakeups.due_in("default", "test").is_some());
+    }
+
+    #[test]
+    fn input_changed_wakes_the_endpoints_using_the_object() {
+        use super::{InputKind, RESTPATH_FINALIZER, Wakeups, input_changed};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ManagedFieldsEntry, Time};
+        use kube::{
+            api::ObjectMeta,
+            runtime::{reflector, watcher::Event},
+        };
+        let (store, mut writer) = reflector::store::<RestEndPoint>();
+        let wakeups = Wakeups::default();
+        let mut meta = ObjectMeta {
+            name: Some("sec".into()),
+            namespace: Some("ns1".into()),
+            ..Default::default()
+        };
+        let mut apply = |r: Arc<RestEndPoint>| writer.apply_watcher_event(&Event::Apply((*r).clone()));
+        apply(rep_with("off", "ns1", false, Some(("sec", None)), None));
+        assert!(input_changed(InputKind::Secret, &meta, &store, &wakeups).is_empty());
+        apply(rep_with("on", "ns1", true, Some(("sec", None)), None));
+        let woken = input_changed(InputKind::Secret, &meta, &store, &wakeups);
+        assert_eq!(woken.len(), 1);
+        assert_eq!(woken[0].name, "on");
+        assert!(wakeups.take_due("ns1", "on"));
+        meta.managed_fields = Some(vec![ManagedFieldsEntry {
+            manager: Some(RESTPATH_FINALIZER.into()),
+            time: Some(Time("2026-01-01T00:00:00Z".parse().unwrap())),
+            ..Default::default()
+        }]);
+        assert!(input_changed(InputKind::Secret, &meta, &store, &wakeups).is_empty());
+        assert!(!wakeups.take_due("ns1", "on"));
+    }
+
+    #[test]
+    fn our_own_writes_do_not_wake_anybody() {
+        use super::{RESTPATH_FINALIZER, written_by_us};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ManagedFieldsEntry, Time};
+        use kube::api::ObjectMeta;
+        let entry = |manager: &str, ts: &str| ManagedFieldsEntry {
+            manager: Some(manager.into()),
+            time: Some(Time(ts.parse().unwrap())),
+            ..Default::default()
+        };
+        let mut meta = ObjectMeta::default();
+        assert!(!written_by_us(&meta), "no managedFields");
+        meta.managed_fields = Some(vec![
+            entry(RESTPATH_FINALIZER, "2026-01-01T00:00:00Z"),
+            entry("kubectl", "2026-01-02T00:00:00Z"),
+        ]);
+        assert!(!written_by_us(&meta), "somebody else wrote last");
+        meta.managed_fields = Some(vec![
+            entry("kubectl", "2026-01-01T00:00:00Z"),
+            entry(RESTPATH_FINALIZER, "2026-01-02T00:00:00Z"),
+        ]);
+        assert!(written_by_us(&meta), "kuberest wrote last");
+        meta.managed_fields = Some(vec![entry(RESTPATH_FINALIZER, "2026-01-01T00:00:00Z")]);
+        assert!(written_by_us(&meta), "only kuberest wrote");
+        for order in [[RESTPATH_FINALIZER, "kubectl"], ["kubectl", RESTPATH_FINALIZER]] {
+            meta.managed_fields = Some(order.map(|m| entry(m, "2026-01-01T00:00:00Z")).to_vec());
+            assert!(!written_by_us(&meta), "same second: the event is kept");
+        }
+    }
 }

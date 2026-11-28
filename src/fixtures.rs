@@ -217,6 +217,7 @@ impl Context {
             client: mock_client,
             metrics: Metrics::default().register(&registry).unwrap(),
             diagnostics: Arc::default(),
+            wakeups: Default::default(),
         };
         (Arc::new(ctx), ApiServerVerifier(handle), registry)
     }

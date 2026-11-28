@@ -12,6 +12,14 @@ use tracing::warn;
 
 pub use k8s_openapi::api::core::v1::Secret;
 
+/// Sign the objects we create: without a field manager, `watchInputs` can't tell our outputs apart
+fn create_params() -> PostParams {
+    PostParams {
+        field_manager: Some(RESTPATH_FINALIZER.to_string()),
+        ..PostParams::default()
+    }
+}
+
 /// Whether the existing Secret `data` holds `decoded` under `key`.
 /// A key that is missing from the existing Secret counts as unmatched, so the
 /// caller updates the Secret instead of panicking on the lookup.
@@ -154,7 +162,7 @@ impl SecretHandler {
             "stringData": strings
         }))
         .unwrap();
-        self.api.create(&PostParams::default(), &secret).await
+        self.api.create(&create_params(), &secret).await
     }
 
     pub async fn update(
@@ -317,7 +325,7 @@ impl ConfigMapHandler {
             "data": data
         }))
         .unwrap();
-        self.api.create(&PostParams::default(), &cm).await
+        self.api.create(&create_params(), &cm).await
     }
 
     pub async fn update(
