@@ -181,6 +181,14 @@ jobs:
           restarts="$(kubectl get pods -l app=kuberest -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}')"
           echo "restarts: ${restarts}"
           for r in ${restarts}; do test "$r" = "0"; done
+      # Regression for issue #73: a missing required input is reported and retried
+      - run: kubectl apply -f examples/abuses/late-input.yaml
+      - run: kubectl wait --for=condition=InputFailed rep/late-input --timeout=60s
+      - run: kubectl wait --for=condition=ready=false rep/late-input --timeout=10s
+      - run: kubectl create secret generic late-input --from-literal=value=here
+      - run: kubectl wait --for=condition=ready rep/late-input --timeout=90s
+      - run: test "$(kubectl get cm late-input-out -ojsonpath='{.data.value}')" = "here"
+      - run: kubectl delete rep late-input --timeout=60s
       # Vault (examples/vault): a real Vault in dev mode, token authentication
       - run: kubectl apply -f examples/vault/dev-vault.yaml
       - run: kubectl wait --for=condition=available deploy/vault --timeout=120s
